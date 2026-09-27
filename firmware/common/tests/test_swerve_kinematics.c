@@ -1,0 +1,128 @@
+/*
+ * 스워브 역기구학 호스트 테스트. STM32/HAL 불필요:
+ *   gcc -std=c99 -lm -o /tmp/swerve_test test_swerve_kinematics.c swerve_kinematics.c && /tmp/swerve_test
+ */
+#include "swerve_kinematics.h"
+#include <math.h>
+#include <stdio.h>
+
+#define PI 3.14159265358979323846
+
+static int g_fail = 0;
+
+static void expect_near(const char *label, float got, float want, float tol)
+{
+    if (fabsf(got - want) > tol) {
+        printf("FAIL %s: got %.5f want %.5f (tol %.5f)\n", label, got, want, tol);
+        g_fail = 1;
+    } else {
+        printf("ok   %s: %.5f\n", label, got);
+    }
+}
+
+/* Symmetric 4-module layout, e.g. 200mm track x 200mm wheelbase.
+ * Order: 0=FL 1=FR 2=RL 3=RR (x+ forward, y+ left) -- placeholder,
+ * replace with real module offsets from CAD. */
+static const swerve_module_pos_t MODULES[SWERVE_NUM_MODULES] = {
+    { 0.12f,  0.12f },  /* FL */
+    { 0.12f, -0.12f },  /* FR */
+    {-0.12f,  0.12f },  /* RL */
+    {-0.12f, -0.12f },  /* RR */
+};
+
+int main(void)
+{
+    swerve_module_state_t state[SWERVE_NUM_MODULES] = {0};
+    swerve_module_cmd_t out[SWERVE_NUM_MODULES];
+    int i;
+
+    /* 1) pure forward: all modules point 0 rad, speed 1 */
+    swerve_ik_compute(1.0f, 0.0f, 0.0f, MODULES, -1.0f, state, out);
+    for (i = 0; i < SWERVE_NUM_MODULES; i++) {
+        char lbl[32];
+        snprintf(lbl, sizeof lbl, "fwd[%d].angle", i);
+        expect_near(lbl, out[i].angle_rad, 0.0f, 1e-4f);
+        snprintf(lbl, sizeof lbl, "fwd[%d].speed", i);
+        expect_near(lbl, out[i].speed_mps, 1.0f, 1e-4f);
+    }
+
+    /* 2) pure strafe left: all modules point +90 deg, speed 1 */
+    swerve_ik_compute(0.0f, 1.0f, 0.0f, MODULES, -1.0f, state, out);
+    for (i = 0; i < SWERVE_NUM_MODULES; i++) {
+        char lbl[32];
+        snprintf(lbl, sizeof lbl, "strafe[%d].angle", i);
+        expect_near(lbl, out[i].angle_rad, (float)PI / 2.0f, 1e-4f);
+        snprintf(lbl, sizeof lbl, "strafe[%d].speed", i);
+        expect_near(lbl, out[i].speed_mps, 1.0f, 1e-4f);
+    }
+
+    /* 3) pure CCW rotation in place: FL tangential dir is 135 deg, but
+     * from the default last_angle=0 that's a >90 deg turn, so the
+     * shortest-path optimizer flips it to -45 deg + reversed speed
+     * (same ground-contact vector, <=90 deg of steering motion). */
+    {
+        swerve_module_state_t rot_state[SWERVE_NUM_MODULES] = {0};
+        swerve_ik_compute(0.0f, 0.0f, 1.0f, MODULES, -1.0f, rot_state, out);
+        expect_near("rotate[FL].angle_deg", out[0].angle_rad * 180.0f / (float)PI, -45.0f, 1e-2f);
+        expect_near("rotate[FL].speed", out[0].speed_mps, -0.12f * sqrtf(2.0f), 1e-4f);
+    }
+
+    /* 4) continuity through the +-pi seam: no flip, no 2*pi jump */
+    {
+        swerve_module_state_t s[SWERVE_NUM_MODULES] = {0};
+        s[0].last_angle_rad = 3.0f; /* ~171.9 deg */
+        s[0].initialized = 1;
+        /* body command whose module-0 raw atan2 lands near -171.9 deg,
+         * i.e. just across the wrap boundary from 3.0 rad */
+        float target_raw = -3.0f;
+        float vx = cosf(target_raw), vy = sinf(target_raw);
+        swerve_ik_compute(vx, vy, 0.0f, MODULES, -1.0f, s, out);
+        /* expect angle to continue smoothly to ~3.283 rad (3.0 + wrap(-3-3)),
+         * not snap back near -3.0, and speed to stay positive */
+        expect_near("wrap[0].angle", out[0].angle_rad, 3.28319f, 1e-3f);
+        expect_near("wrap[0].speed_sign", out[0].speed_mps > 0 ? 1.0f : -1.0f, 1.0f, 1e-6f);
+    }
+
+    /* 5) angle optimization: 170 deg target from 0 becomes -10 deg + flipped speed */
+    {
+        swerve_module_state_t s[SWERVE_NUM_MODULES] = {0};
+        float target_raw = 170.0f * (float)PI / 180.0f;
+        float vx = cosf(target_raw), vy = sinf(target_raw);
+        swerve_ik_compute(vx, vy, 0.0f, MODULES, -1.0f, s, out);
+        expect_near("opt[0].angle_deg", out[0].angle_rad * 180.0f / (float)PI, -10.0f, 1e-2f);
+        if (out[0].speed_mps >= 0) {
+            printf("FAIL opt[0].speed_sign: expected negative, got %.5f\n", out[0].speed_mps);
+            g_fail = 1;
+        } else {
+            printf("ok   opt[0].speed_sign: %.5f\n", out[0].speed_mps);
+        }
+    }
+
+    /* 6) desaturation: cap wheel speed, verify proportional scaling */
+    {
+        swerve_module_state_t s[SWERVE_NUM_MODULES] = {0};
+        swerve_ik_compute(1.0f, 0.0f, 5.0f, MODULES, 0.5f, s, out);
+        float max_abs = 0.0f;
+        for (i = 0; i < SWERVE_NUM_MODULES; i++) {
+            if (fabsf(out[i].speed_mps) > max_abs) max_abs = fabsf(out[i].speed_mps);
+        }
+        expect_near("desat.max_speed", max_abs, 0.5f, 1e-4f);
+    }
+
+    /* 7) deadband: near-zero command holds last angle, zero speed */
+    {
+        swerve_module_state_t s[SWERVE_NUM_MODULES] = {0};
+        s[0].last_angle_rad = 1.2345f;
+        s[0].initialized = 1;
+        swerve_ik_compute(0.0f, 0.0f, 0.0f, MODULES, -1.0f, s, out);
+        expect_near("deadband[0].angle_held", out[0].angle_rad, 1.2345f, 1e-6f);
+        expect_near("deadband[0].speed_zero", out[0].speed_mps, 0.0f, 1e-6f);
+    }
+
+    if (g_fail) {
+        printf("\nSOME TESTS FAILED\n");
+        return 1;
+    }
+    printf("\nALL TESTS PASSED\n");
+    return 0;
+}
