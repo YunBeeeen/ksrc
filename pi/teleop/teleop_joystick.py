@@ -27,6 +27,7 @@ KSRC 스워브 로버용 화면 마우스 조이스틱 텔레옵.
 사용법:
   python3 teleop_joystick.py --port /dev/ttyACM0                 # 실제 로버
   python3 teleop_joystick.py --port /dev/pts/N --format binary   # 시뮬레이터
+  python3 teleop_joystick.py --ros --max-lin 0.25 --max-ang 0.8 # ROS2 대회맵
 """
 import argparse
 import math
@@ -83,22 +84,52 @@ def make_frame_encoder(fmt):
     return encode_velocity_cmd
 
 
+class RosSink:
+    """Publish the same body twist as the serial teleop to the MuJoCo bridge."""
+
+    def __init__(self, topic):
+        import rclpy
+        from geometry_msgs.msg import Twist
+
+        rclpy.init()
+        self.rclpy = rclpy
+        self.Twist = Twist
+        self.node = rclpy.create_node("ksrc_teleop_joystick")
+        self.pub = self.node.create_publisher(Twist, topic, 10)
+
+    def send(self, vx, vy, omega):
+        msg = self.Twist()
+        msg.linear.x = float(vx)
+        msg.linear.y = float(vy)
+        msg.angular.z = float(omega)
+        self.pub.publish(msg)
+
+    def close(self):
+        self.node.destroy_node()
+        self.rclpy.shutdown()
+
+
 def run(args):
     import pygame  # local import so this module stays importable headlessly for tooling
-    import serial
 
     # sim/test_e2e_teleop.py 는 이 필드 없이 자기 Args 객체를 만들어 가상
     # Nucleo 를 구동하는데, 그쪽은 바이너리 프로토콜을 쓴다. 따라서 속성이
     # 없으면 "binary" 를 뜻해야 한다.
-    encode = make_frame_encoder(getattr(args, "format", "binary"))
+    ros_mode = getattr(args, "ros", False)
+    if ros_mode:
+        sink = RosSink(getattr(args, "topic", "/cmd_vel"))
+        send = sink.send
+    else:
+        import serial
+        encode = make_frame_encoder(getattr(args, "format", "binary"))
+        ser = serial.Serial(args.port, args.baud, timeout=0)
+        send = lambda vx, vy, omega: ser.write(encode(vx, vy, omega))
 
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("KSRC swerve teleop (joystick)")
     font = pygame.font.SysFont(None, 22)
     clock = pygame.time.Clock()
-
-    ser = serial.Serial(args.port, args.baud, timeout=0)
 
     left_pad = Pad(LEFT_CENTER, PAD_RADIUS)
     right_pad = Pad(RIGHT_CENTER, PAD_RADIUS)
@@ -150,7 +181,7 @@ def run(args):
 
             now = time.monotonic()
             if now >= next_send:
-                ser.write(encode(vx, vy, omega))
+                send(vx, vy, omega)
                 next_send = now + period
 
             screen.fill((24, 24, 28))
@@ -170,11 +201,13 @@ def run(args):
             pygame.display.flip()
             clock.tick(60)
     finally:
-        zero = encode(0.0, 0.0, 0.0)
         for _ in range(5):
-            ser.write(zero)
+            send(0.0, 0.0, 0.0)
             time.sleep(0.02)
-        ser.close()
+        if ros_mode:
+            sink.close()
+        else:
+            ser.close()
         pygame.quit()
 
 
@@ -189,6 +222,9 @@ def main():
     ap.add_argument("--format", choices=("ascii", "binary"), default="ascii",
                     help="ascii: 'V vx vy omega' lines for the STM32 terminal parser "
                          "(real rover). binary: framed protocol for the simulator.")
+    ap.add_argument("--ros", action="store_true",
+                    help="serial 대신 ROS2 Twist 를 /cmd_vel 로 발행")
+    ap.add_argument("--topic", default="/cmd_vel", help="--ros 발행 토픽")
     ap.add_argument("--max-lin", type=float, default=0.5, help="pad-full-deflection |vx|,|vy| in m/s")
     ap.add_argument("--max-ang", type=float, default=2.0, help="pad-full-deflection |omega| in rad/s")
     args = ap.parse_args()

@@ -26,8 +26,14 @@ SAND_X, SAND_Y = 3.2, 4.0       # 규사 경사지형 STL 범위 -- **주 평가
 
 # 평가용 실측 높이맵.  규사가 기본값이다. 암석지형은 아주 짧게 통과할 구간이라
 # 후순위로 두고, 주행 성능은 규사 경사지형에서 판정한다.
-ARENA_FILES = {"sand": ("assets/sand_hfield.npz", SAND_X, SAND_Y),
-               "rock": ("assets/arena_hfield.npz", EVAL_X, EVAL_Y)}
+import pathlib as _pl
+
+# **모듈 기준 절대경로.**  상대경로("assets/...") 로 두면 다른 디렉토리(ros/ 등)에서
+# import 할 때 파일을 못 찾는다.
+_ASSETS = str(_pl.Path(__file__).resolve().parent / "assets")
+
+ARENA_FILES = {"sand": (_ASSETS + "/sand_hfield.npz", SAND_X, SAND_Y),
+               "rock": (_ASSETS + "/arena_hfield.npz", EVAL_X, EVAL_Y)}
 HF_N = 384                      # 격자 (학습 31mm / 평가 10~13mm 해상도)
 
 
@@ -221,6 +227,58 @@ class Curriculum:
 # 스폰과 목표를 맵 중앙/전역에서 그냥 뽑으면 **절벽 위에 스폰**한다.  실제 규사
 # STL 의 중앙은 87mm -> -144mm 로 한 셀에 231mm 꺾이는 단차라, 로버가 리셋 직후
 # 그대로 전복했다 (전복률 90%).  nav2 도 그런 곳으로 경로를 내지 않는다.
+def export_costmap(kind, out_dir, max_slope_deg=None, inflate_m=0.0):
+    """주행가능 마스크를 **Nav2 정적 맵**(PGM + YAML)으로 내보낸다.
+
+    우리는 이미 `drivable_mask` 가 로버 물리에서 유도된 통과 가능 판정을 갖고 있다
+    (경사 상한 = 견인력 예산에서 나온 21도).  Nav2 는 그걸 occupancy grid 로 받으면
+    되므로 새로 만들 것이 없다.
+
+    값 규약 (nav2_map_server, `trinary` 모드):
+        0   = 점유(lethal)      PGM 픽셀 0
+        254 = 자유              PGM 픽셀 254
+    PGM 은 위에서 아래로 쓰므로 y 축을 뒤집는다 (origin 이 좌하단).
+    """
+    from scipy import ndimage
+    import pathlib as _pl
+    Z = load_arena(kind)
+    ex, ey = eval_extent(kind)
+    if max_slope_deg is None:
+        from config import RoverCfg
+        max_slope_deg = RoverCfg().max_slope_deg
+    drive, _ = drivable_mask(Z, ex, ey, max_slope_deg=max_slope_deg)
+    ny, nx = Z.shape
+    # OccupancyGrid 는 x/y 에 해상도 하나만 쓴다. 원본 hfield 는 정사각 배열이지만
+    # 실제 경기장은 직사각형이므로 y 를 같은 물리 해상도로 재표본화한다.
+    res = ex / nx
+    occ = np.where(drive, 254, 0).astype(np.uint8)
+    if inflate_m > 0:                               # 추가 여유 (Nav2 inflation 과 별개)
+        k = int(round(inflate_m / res))
+        if k > 0:
+            occ = np.where(ndimage.binary_erosion(drive, iterations=k), 254, 0
+                           ).astype(np.uint8)
+    ny_out = int(round(ey / res))
+    rows = np.clip(((np.arange(ny_out) + 0.5) * ny / ny_out).astype(int), 0, ny - 1)
+    occ = occ[rows[::-1], :]                         # PGM 은 위에서 아래
+    d = _pl.Path(out_dir); d.mkdir(parents=True, exist_ok=True)
+    pgm = d / f"arena_{kind}.pgm"
+    with open(pgm, "wb") as f:
+        f.write(b"P5\n# KSRC drivable mask (max_slope %.1f deg)\n%d %d\n255\n"
+                % (max_slope_deg, nx, ny_out))
+        f.write(occ.tobytes())
+    yml = d / f"arena_{kind}.yaml"
+    yml.write_text(
+        "image: %s\n"
+        "mode: trinary\n"
+        "resolution: %.6f\n"
+        "origin: [%.6f, %.6f, 0.0]\n"
+        "negate: 0\n"
+        "occupied_thresh: 0.65\n"
+        "free_thresh: 0.196\n" % (pgm.name, res, -ex / 2, -ey / 2))
+    return str(yml), dict(nx=nx, ny=ny_out, res=res, free=float(np.mean(occ == 254)),
+                          ex=ex, ey=ey)
+
+
 def perturb(Z, ex, ey, rng, amp=0.025, lam=0.20):
     """대회맵 위에 **미세 요철**만 얹는다 (거시 구조는 건드리지 않는다).
 
@@ -309,6 +367,16 @@ def drivable_mask(Z, ex, ey, max_slope_deg=35.0, max_step=0.04, foot=0.16):
     ok = (slope <= np.radians(max_slope_deg)) & (step <= max_step)
     ok[:ky, :] = ok[-ky:, :] = ok[:, :kx] = ok[:, -kx:] = False   # 경계 여유
     return ok, np.degrees(slope)
+
+
+def flat_spawn_mask(drivable, slope_deg, ex, ey, max_slope_deg, clearance_m):
+    """주행 가능 구역 중 로버 풋프린트 전체가 평탄한 스폰 중심만 남긴다."""
+    from scipy.ndimage import distance_transform_edt
+
+    flat = drivable & (slope_deg <= max_slope_deg)
+    ny, nx = flat.shape
+    distance = distance_transform_edt(flat, sampling=(ey / ny, ex / nx))
+    return flat & (distance >= clearance_m)
 
 
 def cell_centers(Z, ex, ey):

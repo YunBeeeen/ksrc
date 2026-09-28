@@ -80,7 +80,7 @@ def build(c: RoverCfg, terrain: str = "plane", hfield_n: int = 384,
         ground = ("", '<geom name="ground" type="plane" size="20 20 0.1" class="terrain"/>')
 
     acts = "\n".join(
-        f'    <position name="a_st_{n}" joint="st_{n}" kp="{c.steer_kp}" '
+        f'    <position name="a_st_{n}" joint="st_{n}" kp="{c.steer_kp}" kv="{c.steer_kv}" '
         f'ctrlrange="{-c.steer_lim:.4f} {c.steer_lim:.4f}" forcerange="{-c.steer_tau} {c.steer_tau}"/>'
         for n, _, _ in CORNERS)
     acts += "\n" + "\n".join(

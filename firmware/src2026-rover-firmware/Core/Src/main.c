@@ -58,7 +58,11 @@ typedef struct {
 #define TICKS_PER_REV       (ENCODER_CPR * GEAR_RATIO) /**< 8384.0 ticks per wheel rev */
 
 /* Wheel radius R (Diameter 96mm -> Radius 48mm = 0.048m) */
-#define WHEEL_RADIUS_M      0.048f             /**< Radius R = 48mm = 0.048m (Diameter 96mm) */
+/* 조립 STL 실측값.  이전 0.048f (지름 96mm) 는 설계 초기 추정치였고 실측과
+ * 20.2% 차이가 났다.  개루프 duty 에서는 "보고되는 속도가 틀리다" 로 끝나지만,
+ * 바퀴 속도 PI 폐루프를 넣으면 PI 가 틀린 측정값을 목표에 맞추려고 duty 를
+ * 계속 왜곡하므로 치명적이다.  sim/rl/config.py 의 wheel_r 과 같은 값이어야 한다. */
+#define WHEEL_RADIUS_M      0.03995f           /**< Radius R = 39.95mm (Diameter 79.9mm), STL 실측 */
 #define PI                  3.1415926535f
 
 /* --- Swerve module geometry & actuator mapping (bench-test placeholder) ---
@@ -67,18 +71,29 @@ typedef struct {
  * servo-ID mapping is also unconfirmed against actual wiring -- both
  * placeholders until bench-verified. Servo IDs use joint.c's array index
  * (0-based; joint_config[] maps index->bus ID internally). */
+/* 조립 STL 실측값 (sim/rl/config.py: axle_x=0.0918, track=0.2367 -> track/2=0.11835).
+ * 이전 (±0.12, ±0.12) 는 추정치였다.  순수 병진(vx, vy)에서는 모듈 위치가 결과에
+ * 영향을 주지 않지만 omega != 0 이면 v_i = v_B + omega x r_i 로 오차가 남는다:
+ *     제자리회전 w=0.8  -> 조향각 최대 7.20도
+ *     선회 vx=0.2 w=0.5 -> 최대 5.15도
+ *     실주행 중앙값     -> 0.90도
+ * 시뮬과 반드시 같은 값이어야 한다 (같은 C 코드를 공유하는 의미가 없어진다). */
 static const swerve_module_pos_t SWERVE_MODULES[SWERVE_NUM_MODULES] = {
-    { 0.12f,  0.12f },  /* module 0: FL */
-    { 0.12f, -0.12f },  /* module 1: FR */
-    {-0.12f,  0.12f },  /* module 2: RL */
-    {-0.12f, -0.12f },  /* module 3: RR */
+    { 0.0918f,  0.11835f },  /* module 0: FL */
+    { 0.0918f, -0.11835f },  /* module 1: FR */
+    {-0.0918f,  0.11835f },  /* module 2: RL */
+    {-0.0918f, -0.11835f },  /* module 3: RR */
 };
 static const MotorID SWERVE_MODULE_MOTOR[SWERVE_NUM_MODULES] = { MOTOR1, MOTOR2, MOTOR3, MOTOR4 };
 
 /* Placeholder until bench-measured (free-spin m/s at 100% duty, see
  * mdd3a_driver.h's open item). Wrong magnitude only scales wheel speed
  * for a given vx/vy/omega, doesn't change direction/shape. */
-#define SWERVE_MAX_WHEEL_MPS  0.3f
+/* 듀티 100% 에서의 바퀴 선속도.  시뮬은 mot_w_noload * wheel_r = 7.96 * 0.03995
+ * = 0.318 m/s 로 계산한다.  이 값이 어긋나면 IK 의 desaturation 기준이 달라져
+ * 같은 cmd_vel 에 대해 시뮬과 실기의 스로틀 스케일이 맞지 않는다.
+ * 실기 벤치테스트로 확정할 값이고, 지금은 시뮬과 일치시킨다. */
+#define SWERVE_MAX_WHEEL_MPS  0.318f
 
 /* STS3215 레지스터 중 sts3215.h 에 없는 것 (공식 메모리표 기준) */
 #define STS_REG_ID_ADDR    0x05  /**< 서보 버스 ID (EPROM, 0~253) */
@@ -735,6 +750,13 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   WheelState_t wheels[MOTOR_COUNT] = {0};
   uint32_t last_log_time = HAL_GetTick();
+  /* 엔코더 속도 추정을 **로깅과 분리**한다.  예전엔 last_log_time 하나로 둘을
+   * 같이 돌려서, 로그 주기를 바꾸면 속도 추정 주기까지 바뀌었다 (그리고 10Hz 는
+   * 바퀴 속도 폐루프에 너무 느리다).
+   * 8384 tick/rev 이므로 20ms 창에서도 분해능이 충분하다:
+   *     0.20 m/s -> 119 tick / 20ms,   0.02 m/s -> 12 tick / 20ms */
+  uint32_t last_enc_time = HAL_GetTick();
+  const uint32_t ENC_PERIOD_MS = 20U;          /* 50 Hz.  PI 를 넣으면 100~200Hz 로 */
   uint32_t step_start_time = HAL_GetTick();
   uint8_t step = 0;
 
@@ -750,11 +772,11 @@ int main(void)
   {
     uint32_t now = HAL_GetTick();
 
-    /* 1. Periodic Kinematics & Encoder Log (every 100ms) */
-    if (now - last_log_time >= 100)
+    /* 1a. 엔코더 속도 추정 (50 Hz, 로깅과 독립) */
+    if (now - last_enc_time >= ENC_PERIOD_MS)
     {
-      float dt = (float)(now - last_log_time) / 1000.0f;
-      last_log_time = now;
+      float dt = (float)(now - last_enc_time) / 1000.0f;
+      last_enc_time = now;
 
       for (uint8_t i = 0; i < MOTOR_COUNT; i++)
       {
@@ -777,10 +799,17 @@ int main(void)
         wheels[i].linear_vel = wheels[i].rad_per_sec * WHEEL_RADIUS_M;
       }
 
-      /* Print detailed state with Timestamp */
+    }
+
+    /* 1b. 로깅 (10 Hz).  printf 는 제어 루프와 절대 같은 주기에 두지 않는다. */
+    if (now - last_log_time >= 100)
+    {
+      float dt = (float)(now - last_log_time) / 1000.0f;
+      last_log_time = now;
       if (s_log_enabled)
       {
-      printf("[TIME:%6lums | dt:%3dms | R=0.048m]\r\n", now, (int)(dt * 1000.0f));
+      printf("[TIME:%6lums | dt:%3dms | R=%dmm]\r\n", now, (int)(dt * 1000.0f),
+             (int)(WHEEL_RADIUS_M * 1000.0f + 0.5f));
       for (uint8_t i = 0; i < MOTOR_COUNT; i++)
       {
         int rpm_int = (int)wheels[i].rpm;

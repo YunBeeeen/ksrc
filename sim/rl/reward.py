@@ -1,73 +1,73 @@
-"""보상 설계.
-
-가중치를 config 로 빼둔 이유: "빠르게 가기" vs "안 빠지기" 의 균형이 대회
-점수 배분(이동 기술 25 / 기술 신뢰성 25)과 직결되는 **판단**이라, 코드가 아니라
-설정으로 바뀌어야 한다.  프리셋 3종을 두고 ablation 으로 비교한다.
-"""
+"""논문의 경로추종 보상을 홀로노믹 스워브 이동에 맞춰 적용한다."""
 from dataclasses import dataclass
+import math
+
+import numpy as np
 
 
 @dataclass
 class RewardCfg:
-    """8차) **매 스텝 양의 보상을 없애고 비용으로 바꿨다.**
+    """진행·정렬·횡오차·이동방향오차·매끄러움으로 경로추종을 평가한다.
 
-    7차까지의 구조에서 순수 IK 의 항별 누적을 재보니 (739 스텝, 12 에피소드):
-        prog +602.2 / yaw +180.1 / alive +14.8 / xt -52.2 / goal +2.0
-    문제가 둘이었다.
-
-      (a) `yaw + alive = +195` 가 **매 스텝 쌓이는데 완주 보너스는 일회성 +3** 이다.
-          빨리 끝내면 195 를 포기하는 셈이라 목표 근처에서 어슬렁거리는 게 이득이다.
-          "거리는 늘었는데 완주로 전환이 안 된다" 던 관측이 이것으로 설명된다.
-      (b) `gamma=0.99` 면 739 스텝 뒤 보너스 3.0 이 **0.0018 로 보인다** -- 사실상
-          없는 항이다.  20초 과제에는 0.998 (시상수 10초) 이 맞다.
-
-    그래서 목적함수를 "목표까지의 비용 최소화" 로 바꿨다:
-        + 유효 진행  - 시간  - 횡이탈  - yaw오차  - 잔차·급변  + 완주  - 전복·고착
-    `alive` 는 삭제하고 `w_time` 으로 부호를 반전했다.  `yaw` 는 가우시안 보상에서
-    선형 **비용**으로 바꿨다.
-
-    slip/sink/scrub/energy/torque 는 **기본 가중치 0** 으로 두고 진단 지표로만 쓴다.
-    항이 13개면 정책이 무엇을 최적화하는지 귀속이 안 된다.  경로추종을 개선하면서
-    특정 부작용이 확인될 때 하나씩 켠다.
+    2026년 4WIS 논문은 차체 기수와 경로 접선을 비교한다. 여기서는 스워브의
+    게걸음·후진을 허용하기 위해 실제 이동 방향과 경로 접선을 비교한다.
+    legacy 는 이전 차체 기수 보상을, position_only 는 방향 항을 빼던 직전
+    보상을 같은 동역학에서 재현하는 비교군이다.
     """
-    # --- 잘한 것 --------------------------------------------------------
-    w_prog:    float = 1.00    # 유효 경로 진행 / (v_cruise*dt), [-1,1].
-                               # 실제 변위로 상한돼 정지 상태에선 0 이다.
-    r_goal:    float = 20.0    # 완주.  gamma=0.998 로 할인하면 ~0.23 배로 보인다
-    # --- 비용 (전부 [0,1] 정규화) ---------------------------------------
-    w_time:    float = 0.05    # 시간.  예전 alive(+0.02) 의 부호 반전 + 강화
-    w_xt:      float = 1.00    # 횡이탈 |e_y|/xt_sat
-    # 9차) 0.50 -> 1.20.  v6 에서 누적이 prog +398 vs yaw -243 으로 전진이 이겼고,
-    # 정책은 duty 를 0.682 -> 0.873 으로 밀어 슬립을 0.392 -> 0.464 로 키웠다.
-    # 슬립이 커지면 좌우 비대칭이 커져 yaw 추종이 0.57 -> 0.40 으로 무너진다.
-    # 1.20 이면 yaw 누적이 약 -580 이 되어 prog 를 역전한다.
-    w_yaw:     float = 1.20    # 요속도 추종오차 |dw|/yaw_sigma
-    w_resid:   float = 0.03    # 잔차 크기 (IK 근처에 머물게)
-    w_smooth:  float = 0.05    # 2차 차분 (고주파 진동)
-    # --- 진단만 (기본 0.  부작용이 확인되면 켠다) ------------------------
-    w_slip:    float = 0.00
-    w_sink:    float = 0.00
-    w_scrub:   float = 0.00
-    w_energy:  float = 0.00
-    # 기어박스 연속정격(0.49 N*m) 초과분.  0 으로 둔다 -- 실측 순 관절토크가
-    # 정격을 넘는 비율이 순수 IK 0.1% / 정책 0.4% 로 애초에 문제가 아니다.
-    # (한때 11.7% 라고 쟀는데 그건 요청 duty 로 계산한 오류였다.  MuJoCo 는
-    #  지연·전압이 반영된 duty 를 넣고 감쇠는 서브스텝에서 평가된다.)
-    w_torque:  float = 0.00
-    # --- 종료 ----------------------------------------------------------
-    r_tip:     float = -10.0   # 전복
-    r_stuck:   float = -5.0    # 고착
-    # --- 커널 폭 --------------------------------------------------------
-    yaw_sigma: float = 0.30    # rad/s.  비용이 1.0 로 포화하는 오차
-    xt_sat:    float = 0.15    # m.  횡이탈 비용이 포화하는 지점
+    w_prog:    float = 0.15    # + 진행 바닥값
+    w_align:   float = 0.85    # + 횡이탈·이동방향 게이트가 걸린 진행
+    w_lat:     float = 0.05    # - 이동 중 횡오차 (정지 유도 방지)
+    w_course:  float = 0.02    # - 이동 방향과 경로 접선의 오차
+    w_smooth:  float = 0.10    # - 행동 2차 차분
+    w_resid:   float = 0.03    # - 지속적인 큰 차체속도 잔차
+    r_goal:    float = 20.0
+    r_tip:     float = -10.0
+    r_stuck:   float = -5.0
+    r_oob:     float = -10.0   # 예전엔 벌점이 **없어서** 경계 밖 탈출이 공짜였다
+    sigma_y:   float = 0.10    # m.  수 cm 추종오차를 구별하는 폭
+    sigma_course: float = 0.35  # rad.  이동 방향오차 정규화 폭
+    course_gate: bool = True
+    heading_gate: bool = False  # legacy 비교군에만 차체 기수 게이트 적용
 
 
 PRESETS = {
-    # 이동 기술 점수 우선: 빨리 간다. 정확도를 좀 감수.
-    "speed":    RewardCfg(w_prog=1.4, w_time=0.08, w_xt=0.60, r_goal=25.0),
-    # 기술 신뢰성 우선: 느려도 경로를 지킨다.
-    "safe":     RewardCfg(w_prog=0.8, w_time=0.03, w_xt=1.60, w_yaw=0.80,
-                          r_stuck=-10.0),
-    # 기본값
+    "speed":    RewardCfg(w_prog=0.30, w_align=0.90, w_resid=0.02, r_goal=25.0),
+    "safe":     RewardCfg(w_prog=0.10, w_align=0.90, sigma_y=0.08,
+                          w_resid=0.04),
     "balanced": RewardCfg(),
+    "position_only": RewardCfg(w_lat=0.0, w_course=0.0, course_gate=False),
+    "legacy":   RewardCfg(w_prog=1.0, w_align=0.80, w_resid=0.0,
+                          w_lat=0.0, w_course=0.0, sigma_y=0.30,
+                          course_gate=False, heading_gate=True),
 }
+
+
+def tracking_terms(prog, e_y, e_psi, action, prev_action, prev2_action, cfg,
+                   *, course_error=0.0, movement=0.0):
+    """참값 위치·이동방향으로 논문식 항을 계산한다. movement 는 기준속도 대비 이동량."""
+    if cfg.sigma_y <= 0 or not math.isfinite(cfg.sigma_y):
+        raise ValueError("sigma_y 는 양의 유한한 숫자여야 합니다")
+    if cfg.sigma_course <= 0 or not math.isfinite(cfg.sigma_course):
+        raise ValueError("sigma_course 는 양의 유한한 숫자여야 합니다")
+    lateral_error_sq = (e_y / cfg.sigma_y) ** 2
+    lateral_gate = math.exp(-lateral_error_sq)
+    gate = lateral_gate
+    if cfg.course_gate:
+        gate *= max(0.0, math.cos(course_error))
+    if cfg.heading_gate:
+        gate *= max(0.0, math.cos(e_psi))
+    moving = float(np.clip(movement, 0.0, 1.0))
+    # 정지 중에는 이동 방향이 정의되지 않는다. 횡오차·방향 벌점도 정지 중
+    # 누적되지 않게 하여, 일찍 실패해서 비용을 끊는 해를 만들지 않는다.
+    course_error_sq = min((course_error / cfg.sigma_course) ** 2, 4.0)
+    a = np.asarray(action, dtype=float)
+    d2 = a - 2.0 * np.asarray(prev_action) + np.asarray(prev2_action)
+    terms = {
+        "prog": cfg.w_prog * prog,
+        "align": cfg.w_align * prog * gate,
+        "lat": -cfg.w_lat * moving * min(lateral_error_sq, 4.0),
+        "course": -cfg.w_course * moving * lateral_gate * course_error_sq,
+        "smooth": -cfg.w_smooth * float(np.mean(d2 ** 2)),
+        "resid": -cfg.w_resid * float(np.mean(a ** 2)),
+    }
+    return gate, terms

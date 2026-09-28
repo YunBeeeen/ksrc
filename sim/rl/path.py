@@ -223,3 +223,42 @@ def start_heading(path, L=0.5):
     """경로 시작부의 진행 방향.  스폰 자세를 여기에 대충 맞춘다."""
     d = path.at(min(L, path.total)) - path.P[0]
     return float(np.arctan2(d[1], d[0]))
+
+
+def heading_at(path, s, eps=0.05):
+    """호길이 s 지점의 **경로 방향**.  중앙 현(central chord) 으로 정의한다.
+
+    선분 접선을 그대로 쓰면 꼭짓점에서 각도가 순간 점프한다 (우리 경로는 꺾임이
+    최대 70도).  그러면 스폰 자세·관측 e_psi·보상이 같은 지점에서 불연속을 겪는다.
+    중앙 현은 s 에 대해 연속이고 직선 구간에서는 접선과 같다.
+
+    스폰 자세·관측 e_psi·실제 이동방향 보상이 같은 접선 정의를 공유한다.
+    """
+    a = path.at(max(s - eps, 0.0))
+    b = path.at(min(s + eps, path.total))
+    d = b - a
+    if float(np.linalg.norm(d)) < 1e-9:          # 경로가 eps 보다 짧은 극단
+        d = path.U[min(path.i, len(path.U) - 1)]
+    return float(np.arctan2(d[1], d[0]))
+
+
+def make_path_set(n, drive, Z, ex, ey, seed, **kw):
+    """고정 경로 세트.  **학습용과 평가용을 반드시 다른 seed 로 만든다.**
+
+    같은 세트로 학습·평가하면 `s0` 를 랜덤화해도 "그 geometry 를 외운 건지"
+    구분할 수 없다.
+    """
+    rng = np.random.default_rng(seed)
+    out = []
+    while len(out) < n:
+        st = terr.sample_drivable(drive, Z, ex, ey, rng, 1)[0]
+        pth = make_path(drive, Z, ex, ey, rng, st, **kw)
+        if pth.total >= 2.0:                     # 퇴화 경로 제외
+            out.append(pth)
+    return out
+
+
+def clone(path):
+    """같은 꼭짓점의 새 RefPath.  투영 상태(s_last, p_last, i)가 독립이어야
+    보상용(참값)과 컨트롤러용(추정치)을 분리할 수 있다."""
+    return RefPath(path.P)

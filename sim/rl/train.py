@@ -7,7 +7,7 @@
 (관측/보상/랜덤화)이고, 마감이 있는 상황에서 PPO 를 직접 구현해서 디버깅할
 이유가 없다.  "학습이 안 되는 게 내 PPO 버그 때문인가"를 의심하지 않아도 된다.
 """
-import argparse, dataclasses, os, pathlib
+import argparse, os, pathlib
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize
@@ -16,14 +16,28 @@ from stable_baselines3.common.monitor import Monitor
 
 import sys; sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from env import RoverEnv
+import terrain as terr
+import path as pth
+from config import RoverCfg
+
+
+def stage1_paths(kind, seed, n):
+    """Stage 1 고정 경로 세트.  학습/평가는 **다른 seed** 여야 한다."""
+    Z = terr.load_arena(kind); ex, ey = terr.eval_extent(kind)
+    drive, _ = terr.drivable_mask(Z, ex, ey, max_slope_deg=RoverCfg().max_slope_deg)
+    return pth.make_path_set(n, drive, Z, ex, ey, seed=seed)
 from reward import PRESETS as REWARD_PRESETS
 
 
 def make_env(rank, args):
     def _f():
         rew = REWARD_PRESETS[args.reward]
-        if args.w_energy is not None:
-            rew = dataclasses.replace(rew, w_energy=args.w_energy)
+        paths = None
+        if args.stage1:
+            # Stage 1: 경로 세트 고정 + 랜덤화/교란/커리큘럼 OFF.
+            # "3D 차체 잔차가 경로추종 자체를 배우나" 만 본다.
+            paths = stage1_paths(args.terrain if args.terrain != "proc" else "sand",
+                                 args.path_seed, args.n_paths)
         env = RoverEnv(rew=rew, difficulty=args.d0,
                        episode_s=args.episode_s, privileged=args.teacher,
                        seed=args.seed + rank,
@@ -32,7 +46,10 @@ def make_env(rank, args):
                        # 대회 당일까지 움직인다 (다른 팀 주행/갈퀴질/습도).
                        arena_eval=(args.terrain != "proc"),
                        eval_kind=(args.terrain if args.terrain != "proc" else "sand"),
-                       perturb=(0.0 if args.terrain == "proc" else args.perturb))
+                       perturb=(0.0 if args.terrain == "proc" else args.perturb),
+                       paths=paths,
+                       drive_align_gate_deg=args.drive_align_gate_deg,
+                       randomize=(not args.stage1))
         # Monitor 가 있어야 SB3 가 rollout/ep_rew_mean, ep_len_mean 을 찍는다.
         # make_vec_env() 헬퍼는 자동으로 씌워주지만 SubprocVecEnv 를 직접 만들면
         # 안 씌워진다 -- 그래서 터미널에 손실만 나오고 보상이 안 나왔다.
@@ -79,9 +96,15 @@ class MetricsCallback(BaseCallback):
     # (slip/sink/e_y/yaw/energy), 그러면 누적 비율인 f_belly 와 의미가 섞인다.
     # 실측 차이: 종료스텝 slip 0.149 vs 에피소드 평균 0.482 (3.2배).
     KEYS = ("success", "stuck", "tip", "oob", "goals", "dist", "frac", "goal_dist",
-            "e_y_m", "e_y_p90", "e_y_max", "slip_m", "slip_p90", "sink_m",
-            "yaw_m", "prog_m", "pw_m", "e_J", "e_per_m",
-            "f_belly", "f_lifted", "duty_sat", "duty_use", "steer_use")
+            # 경로추종 정확도 -- 논문과 같은 지표
+            "e_y_m", "e_y_p90", "e_y_max", "e_psi_m", "e_psi_p90",
+            "course_m", "course_p90", "t_elapsed",
+            # 3D 잔차 진단.  a_use/a_p95 가 ±1 에 박혀 있으면 action bound 부족,
+            # 0 에 가까우면 기본 컨트롤러가 이미 충분하거나 보상이 잔차 사용을
+            # 유도하지 못하는 것이다.  cmd_sat/wheel_desat 은 제한에 걸린 비율.
+            "a_use", "a_p95", "cmd_sat", "wheel_desat",
+            "slip_m", "slip_p90", "sink_m", "prog_m", "pw_m", "e_J", "e_per_m",
+            "f_belly", "f_lifted", "duty_sat", "duty_use", "drive_gate", "steer_use")
     CAUSES = ("배걸림-하중상실", "배걸림-접촉", "막힘", "슬립고착")
     TAGS = {"배걸림-하중상실": "lost_load", "배걸림-접촉": "belly",
             "막힘": "blocked", "슬립고착": "slip_stuck"}
@@ -130,16 +153,21 @@ def main():
     p.add_argument("--episode-s", type=float, default=20.0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="runs/ppo")
+    p.add_argument("--drive-align-gate-deg", type=float, default=10.0,
+                   help="네 조향각 공통 구동 허용 오차 [deg], 0=게이트 끔")
     p.add_argument("--clip-steer-deg", type=float, default=10.0)
     p.add_argument("--clip-duty", type=float, default=0.60)   # 0.2 로는 모래 감속 여유 부족
     p.add_argument("--w-energy", type=float, default=None,
-                   help="에너지 벌점 가중치 (기본 0.05). RL 정책이 순수 IK 대비 "
-                        "에너지를 2.4배 쓰므로(650mAh 팩에서 주행시간 절반) 올려본다. "
-                        "0.05 는 전체 보상의 0.5%% 로 사실상 꺼져 있다")
+                   help="현재 미지원: 차축 부하 모델을 검증하기 전에는 보상에 넣지 않음")
     # gamma 는 **시간 지평**으로 정한다.  gamma = exp(-dt/tau).
     # 0.99 는 50Hz 에서 시상수 2초라 20초 과제의 완주 보너스가 739 스텝 뒤
     # 0.0006 배로 보인다 -- 사실상 없는 항이 된다.  0.998 = 시상수 10초.
     p.add_argument("--gamma", type=float, default=0.998)
+    p.add_argument("--stage1", action="store_true",
+                   help="Stage 1 sanity check: 경로 세트 고정, 랜덤화·교란·노이즈·"
+                        "커리큘럼 전부 OFF.  3D 잔차가 경로추종을 배우는지만 본다")
+    p.add_argument("--path-seed", type=int, default=1234, help="학습 경로 세트 seed")
+    p.add_argument("--n-paths", type=int, default=10)
     p.add_argument("--terrain", default="proc", choices=["proc", "sand", "rock"],
                    help="학습 지형. proc=절차생성, sand/rock=대회맵 고정(미세 요철 교란)")
     p.add_argument("--perturb", type=float, default=0.020,
@@ -147,6 +175,10 @@ def main():
     p.add_argument("--teacher", action="store_true",
                    help="특권 관측으로 teacher 학습 (이후 distill.py 로 student 증류)")
     args = p.parse_args()
+    if not np.isfinite(args.drive_align_gate_deg) or args.drive_align_gate_deg < 0:
+        p.error("--drive-align-gate-deg 는 0 이상의 유한한 숫자여야 합니다")
+    if args.w_energy is not None:
+        p.error("--w-energy 는 현재 미지원입니다. 차축 부하 모델 검증 후 활성화하세요")
 
     out = pathlib.Path(args.out); out.mkdir(parents=True, exist_ok=True)
     venv = SubprocVecEnv([make_env(i, args) for i in range(args.envs)])
@@ -177,7 +209,8 @@ def main():
                                    **policy_kwargs),
                 tensorboard_log=tb)
     model.learn(total_timesteps=args.steps, callback=[
-        CurriculumCallback(d0=args.d0, verbose=1),
+        # Stage 1 은 난이도를 고정한다 (변수 하나라도 움직이면 판정이 흐려진다)
+        *([] if args.stage1 else [CurriculumCallback(d0=args.d0, verbose=1)]),
         MetricsCallback(),
         # save_vecnormalize 를 켜야 중간 체크포인트를 평가할 수 있다.  안 켜면
         # 관측 정규화 통계가 학습 끝에만 저장돼서, 중단하면 체크포인트가 있어도
