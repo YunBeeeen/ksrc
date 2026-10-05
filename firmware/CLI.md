@@ -209,8 +209,11 @@ sudo apt install -y python3-spidev
 sudo usermod -aG dialout pi      # /dev/spidev0.0 이 dialout 그룹. 재접속 후 적용
 ```
 
-배선: Nucleo PB12 → Pi 핀24 (CE0), PB13 → 핀23 (SCLK), PC2 → 핀21 (MISO),
-PC3 → 핀19 (MOSI), GND 공통.
+배선: Nucleo PB12 (CN10-16) → Pi 핀24 (CE0), PB13 (CN10-30) → 핀23 (SCLK),
+PC2 (CN7-35) → 핀21 (MISO), PC3 (CN7-37) → 핀19 (MOSI),
+그리고 **Pi 핀25 (GND) → Nucleo GND 직결선** (모터 GND 묶음과 별도).
+**SCLK 선은 MOSI·MISO 와 떼어서** (가능하면 GND 선과 나란히) 보낸다. 묶어 두면 크로스토크로
+가짜 클럭이 생겨 프레임이 전부 깨진다 (2026-10-05 실측, 속도를 낮춰도 안 없어짐). MISO·MOSI 는 묶어도 됨.
 
 ```bash
 cd ~/ksrc
@@ -220,7 +223,38 @@ python3 pi/common/spi_monitor.py --vy 0.05     # 게걸음
 python3 pi/common/spi_monitor.py --w 0.5       # 제자리 회전
 ```
 `[BAD]` 만 나오면 배선·CE0·GND 확인. 출력 태그 `W` = 워치독, `G` = 게이트 대기,
-`T` = 게이트 타임아웃.
+`T` = 게이트 타임아웃. `enc[...]` = 엔코더 누적 틱 (FL FR RL RR, 바퀴 1회전 8384).
+
+**`[BAD]` 원인 좁히기** (시리얼 `SPI` 명령과 같이):
+```bash
+# Pi: 정확히 10바이트(클럭 80번)만 보낸다
+python3 -c "import spidev;s=spidev.SpiDev();s.open(0,0);s.mode=0;s.max_speed_hz=10000;s.xfer2([0xA5,0x5A,1,2,3,4,5,6,7,8])"
+```
+그다음 miniterm 에서 `SPI` → `마지막 N바이트 첫 XX XX`:
+`10바이트 A5 5A` 정상 / `11바이트 이상` = SCLK 링잉(선 분리·GND·직렬저항) /
+`CS에지 0` = CE0 선 / `0바이트` = SCLK 선 / `10바이트인데 다른 값` = MOSI 선.
+
+### IMU 확인
+```bash
+python3 pi/common/imu_check.py      # 2초 정지 보정 후 10Hz: acc, |acc|, roll/pitch, gyro, 자이로 적분각
+```
+값은 **로버 좌표** (x 전진, y 좌측, z 위). 칩→로버 변환은 `pi/common/nucleo_link.py`
+`IMU_CHIP_TO_BODY` (현재 칩이 z 기준 180° 장착 → x, y 반대). 정상: 정지 시 acc ≈ 0 0 +1,
+반시계 90° → 셋째 누적 ≈ +90, 앞을 숙이면 pitch +. Enter = 누적각 리셋.
+
+### 조이스틱 주행 (라파 → SPI)
+라파는 화면이 없으므로 창을 PC 로 가져온다 (X11 포워딩).
+```bash
+# PC 에서 (-X 가 창 포워딩)
+ssh -X pi@raspberrypi.local
+# 라파에서. 처음 한 번: sudo apt install -y python3-pygame
+cd ~/ksrc
+python3 pi/teleop/teleop_joystick.py --spi --rate 50 --max-lin 0.15 --max-ang 0.8 --monitor
+```
+조작·인자는 5 와 같다. `--spi` 는 USB 시리얼 대신 SPI 로 보내고, 교환할 때마다 돌아오는
+텔레메트리로 `STM>` 줄(STM 이 실제 적용한 v, 조향각, duty)과 창 아래 초록 줄을 찍는다.
+`--rate` 는 SPI 라 50 까지 문제없다 (시리얼은 20). `crc_bad` 가 늘면 위 배선 확인.
+창이 끊기면(와이파이) 명령도 멈추고 STM 워치독이 500ms 뒤 정지시킨다.
 
 ---
 
@@ -237,4 +271,7 @@ python3 pi/common/spi_monitor.py --w 0.5       # 제자리 회전
 | 바퀴가 안 돌고 1.5초씩 멈춤 | 정렬 게이트가 서보 각을 못 읽음 (서보 전원/배선). 서보 없이 시험할 땐 `GATE` |
 | `PING` 전부 FAIL | 서보 12V·PB10 배선·ID 확인 |
 | `IMU ... 응답 없음` (부팅 메시지) | SPI3 배선, CS = PC9 확인. 1초마다 재시도함 |
+| Pi `[BAD]` 계속 / `SPI` 파싱오류 증가 | SCLK 선을 MOSI·MISO 와 분리, Pi 핀25 GND 직결 (6 참고) |
+| IMU 세 축이 같은 값 / 가끔 튐 | SPI3 잡음. 펌웨어가 즉시 무효 처리·재설정. 잦으면 PC10(SCK) 선 분리 |
+| `cannot open display` (조이스틱 --spi) | `ssh -X` 로 접속했는지 확인 |
 | 조향이 너무 빠름 | `S 1500` 등으로 제한 |

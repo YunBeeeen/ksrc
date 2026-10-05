@@ -24,8 +24,13 @@ KSRC 스워브 로버용 화면 마우스 조이스틱 텔레옵.
   binary -> common/nucleo_link.py 의 프레임 프로토콜. 시뮬레이터의 가상
             Nucleo 가 쓰는 포맷.
 
+  spi    -> (--spi) Pi SPI0 -> Nucleo SPI2 로 spi_link 프레임 (CRC16). 라파에서 실주행용.
+            교환할 때마다 텔레메트리가 돌아오므로 --monitor 는 시리얼 없이 그걸 찍는다.
+            라파가 헤드리스라 창은 `ssh -X pi@raspberrypi.local` 로 PC 화면에 띄운다.
+
 사용법:
-  python3 teleop_joystick.py --port /dev/ttyACM0                 # 실제 로버
+  python3 teleop_joystick.py --spi --rate 50 --max-lin 0.15 --max-ang 0.8 --monitor  # 라파 -> SPI
+  python3 teleop_joystick.py --port /dev/ttyACM0                 # 실제 로버 (USB 시리얼)
   python3 teleop_joystick.py --port /dev/pts/N --format binary   # 시뮬레이터
   python3 teleop_joystick.py --ros --max-lin 0.25 --max-ang 0.8 # ROS2 대회맵
 """
@@ -36,7 +41,8 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # pi/ -> import common.*
-from common.nucleo_link import encode_velocity_cmd
+from common.nucleo_link import (TLM_FLAG_GATE_PENDING, TLM_FLAG_WATCHDOG,
+                                encode_velocity_cmd)
 from joystick_math import (apply_deadzone, clamp_to_unit_circle, left_pad_to_linear,
                            lock_low_speed_direction, right_pad_to_angular, snap_to_axes)
 
@@ -128,9 +134,23 @@ def run(args):
     # Nucleo 를 구동하는데, 그쪽은 바이너리 프로토콜을 쓴다. 따라서 속성이
     # 없으면 "binary" 를 뜻해야 한다.
     ros_mode = getattr(args, "ros", False)
+    spi_mode = getattr(args, "spi", False)
+    last_tlm = None   # --spi: 가장 최근 텔레메트리
+    n_spi_bad = 0
     if ros_mode:
         sink = RosSink(getattr(args, "topic", "/cmd_vel"))
         send = sink.send
+    elif spi_mode:
+        from common.nucleo_link import SpiLink
+        link = SpiLink(args.spi_bus, args.spi_dev, args.spi_speed)
+
+        def send(vx, vy, omega):
+            nonlocal last_tlm, n_spi_bad
+            tlm = link.exchange(vx, vy, omega)
+            if tlm is None:
+                n_spi_bad += 1
+            else:
+                last_tlm = tlm
     else:
         import serial
         encode = make_frame_encoder(getattr(args, "format", "binary"))
@@ -141,7 +161,9 @@ def run(args):
     monitor = getattr(args, "monitor", False) and not ros_mode
     rx_buf = b""
     next_mon = time.monotonic()
-    if monitor:
+    if monitor and spi_mode:
+        print("[monitor] PI > 는 보낸 값, STM> 는 STM 이 실제 적용한 명령·조향·duty (SPI 텔레메트리, 5Hz)")
+    elif monitor:
         ser.write(b"CTRL ON\n")
         print("[monitor] PC > 는 보낸 값, STM> 는 펌웨어가 받은 값 (텔레옵 시작 후 5Hz)")
 
@@ -212,7 +234,22 @@ def run(args):
                 send(vx, vy, omega)
                 next_send = now + period
 
-            if monitor:
+            if monitor and spi_mode:
+                if now >= next_mon:
+                    print(f"PI > v {vx + 0.0:+.3f} {vy + 0.0:+.3f} {omega + 0.0:+.3f}")
+                    if last_tlm is not None:
+                        t = last_tlm
+                        f = t["flags"]
+                        tags = ("W" if f & TLM_FLAG_WATCHDOG else "-") + \
+                               ("G" if f & TLM_FLAG_GATE_PENDING else "-")
+                        deg = " ".join(f"{math.degrees(a):+6.1f}" for a in t["steer_cmd_rad"])
+                        duty = " ".join(f"{d:+4d}" for d in t["duty"])
+                        print(f"STM> v {t['cmd'][0] + 0.0:+.3f} {t['cmd'][1] + 0.0:+.3f} {t['cmd'][2] + 0.0:+.3f} "
+                              f"| deg {deg} | duty {duty} [{tags}] crc_bad={n_spi_bad}")
+                    else:
+                        print(f"STM> (아직 유효 프레임 없음, crc_bad={n_spi_bad})")
+                    next_mon = now + 0.2
+            elif monitor:
                 rx_buf += ser.read(4096)
                 while b"\n" in rx_buf:
                     line, rx_buf = rx_buf.split(b"\n", 1)
@@ -236,6 +273,13 @@ def run(args):
             help_text = "drag pads with mouse | Q/E rotate | space=stop | Esc=quit"
             screen.blit(font.render(readout, True, (220, 220, 230)), (16, 16))
             screen.blit(font.render(help_text, True, (140, 140, 150)), (16, 44))
+            if spi_mode:
+                if last_tlm is not None:
+                    c = last_tlm["cmd"]
+                    stm = f"STM got vx={c[0]:+.2f} vy={c[1]:+.2f} omega={c[2]:+.2f}  crc_bad={n_spi_bad}"
+                else:
+                    stm = f"STM: no valid frame yet  crc_bad={n_spi_bad}"
+                screen.blit(font.render(stm, True, (120, 220, 140)), (16, HEIGHT - 30))
 
             pygame.display.flip()
             clock.tick(60)
@@ -245,6 +289,8 @@ def run(args):
             time.sleep(0.02)
         if ros_mode:
             sink.close()
+        elif spi_mode:
+            link.close()
         else:
             ser.close()
         pygame.quit()
@@ -255,6 +301,11 @@ def main():
     ap.add_argument("--port", default="/dev/ttyACM0",
                     help="serial device to the Nucleo (ST-Link VCP is usually /dev/ttyACM0)")
     ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--spi", action="store_true",
+                    help="시리얼 대신 Pi SPI0 -> Nucleo SPI2 로 보낸다 (라파에서 실행)")
+    ap.add_argument("--spi-bus", type=int, default=0)
+    ap.add_argument("--spi-dev", type=int, default=0)
+    ap.add_argument("--spi-speed", type=int, default=1_000_000)
     ap.add_argument("--rate", type=float, default=20.0,
                     help="command send rate, Hz. Above ~30 the firmware's line parser "
                          "starts dropping bytes while it services a command.")
