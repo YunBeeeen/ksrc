@@ -78,6 +78,15 @@ assert 2 + _TLM_BODY.size == SPI_FRAME_LEN - 2
 # 원시값 -> 물리량 (펌웨어 imu_ism330.c 설정: ±500 dps, ±4 g)
 IMU_GYRO_DPS_PER_LSB = 0.0175
 IMU_ACC_G_PER_LSB = 0.000122
+
+# 칩 좌표 -> 로버 좌표 (x 전진, y 좌측, z 위). 로버축 i = 부호 * 칩축[인덱스].
+# 2026-10-05 실측: 칩이 z 축 기준 180도 돌아간 채 장착 -> x, y 반대, z 그대로
+# (정지 시 칩 acc z = +1g, 손으로 돌려 x/y 부호 확인). 장착을 바꾸면 여기만 고친다.
+IMU_CHIP_TO_BODY = ((0, -1), (1, -1), (2, +1))
+
+
+def _chip_to_body(xyz):
+    return tuple(sign * xyz[idx] for idx, sign in IMU_CHIP_TO_BODY)
 STEER_STEP_PER_REV = 4096
 
 
@@ -131,9 +140,10 @@ def decode_spi_telemetry(frame: bytes):
         "wheel_mps": v[13:17],
         "steer_cmd_rad": v[17:21],
         "duty": v[21:25],
-        "imu_raw": v[25:31],              # gyro xyz, acc xyz (센서 좌표계)
-        "gyro_dps": tuple(x * IMU_GYRO_DPS_PER_LSB for x in v[25:28]),
-        "acc_g": tuple(x * IMU_ACC_G_PER_LSB for x in v[28:31]),
+        "imu_raw": v[25:31],              # gyro xyz, acc xyz (칩 좌표계 원시값)
+        # 아래 둘은 로버 좌표계 (IMU_CHIP_TO_BODY 적용)
+        "gyro_dps": _chip_to_body([x * IMU_GYRO_DPS_PER_LSB for x in v[25:28]]),
+        "acc_g": _chip_to_body([x * IMU_ACC_G_PER_LSB for x in v[28:31]]),
         "rx_err": v[31],
         "steer_meas_rad": v[32:36],
         "steer_speed": v[36:40],          # step/s (4096 step = 1회전)
