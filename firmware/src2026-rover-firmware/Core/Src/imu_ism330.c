@@ -77,6 +77,16 @@ static int whoami_ok(void)
     return reg_read(REG_WHO_AM_I, &id, 1) && id == WHO_AM_I_VALUE;
 }
 
+/* 설정 레지스터가 우리가 쓴 값 그대로인지 (센서가 전원 흔들림으로 리셋되면
+ * WHO_AM_I 는 그대로인데 설정만 기본값(정지)으로 돌아간다) */
+static int config_ok(void)
+{
+    uint8_t v[3];
+    if (!reg_read(REG_CTRL1_XL, v, 3)) return 0;
+    return v[0] == CTRL1_XL_CFG && v[1] == CTRL2_G_CFG &&
+           v[2] == (CTRL3_BDU | CTRL3_IF_INC);
+}
+
 static int configure(void)
 {
     if (!whoami_ok()) return 0;
@@ -88,11 +98,7 @@ static int configure(void)
     if (!reg_write(REG_CTRL1_XL, CTRL1_XL_CFG)) return 0;
     if (!reg_write(REG_CTRL2_G, CTRL2_G_CFG)) return 0;
 
-    /* 설정이 실제로 들어갔는지 되읽기 */
-    uint8_t v[3];
-    if (!reg_read(REG_CTRL1_XL, v, 3)) return 0;
-    return v[0] == CTRL1_XL_CFG && v[1] == CTRL2_G_CFG &&
-           v[2] == (CTRL3_BDU | CTRL3_IF_INC);
+    return config_ok();
 }
 
 int Imu_Init(void)
@@ -110,10 +116,12 @@ int Imu_Init(void)
     g.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOC, &g);
 
+    /* 출력 슬루를 가장 느리게: 1MHz 에는 충분하고, 점퍼선 링잉(가짜 클럭 -> 비트 오류,
+     * 설정 레지스터 덮어쓰기)을 줄인다. 직렬 저항을 단 것과 비슷한 효과. */
     g.Pin = GPIO_PIN_10 | GPIO_PIN_11 | GPIO_PIN_12;
     g.Mode = GPIO_MODE_AF_PP;
     g.Pull = GPIO_NOPULL;
-    g.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
     g.Alternate = GPIO_AF6_SPI3;
     HAL_GPIO_Init(GPIOC, &g);
 
@@ -136,6 +144,20 @@ int Imu_Read(int16_t out[6])
         memset(out, 0, 6 * sizeof out[0]);
         return 0;
     }
+    /* 12바이트가 전부 같으면 주소 자동증가가 꺼진 것 (SPI 잡음으로 설정 레지스터가
+     * 덮어써진 경우 등 -- 같은 레지스터만 반복해 읽힌다). 실측 노이즈가 있어 정상
+     * 데이터에선 사실상 나오지 않는다. 무효로 두고 다음 Imu_Check 에서 재설정. */
+    int same = 1;
+    for (int i = 1; i < (int)sizeof b; i++)
+    {
+        if (b[i] != b[0]) { same = 0; break; }
+    }
+    if (same)
+    {
+        s_valid = 0;
+        memset(out, 0, 6 * sizeof out[0]);
+        return 0;
+    }
     for (int i = 0; i < 6; i++)
     {
         out[i] = (int16_t)(b[2 * i] | (b[2 * i + 1] << 8));
@@ -145,11 +167,8 @@ int Imu_Read(int16_t out[6])
 
 int Imu_Check(void)
 {
-    if (s_valid)
-    {
-        s_valid = (uint8_t)whoami_ok();
-    }
-    else
+    /* WHO_AM_I 와 설정을 둘 다 확인하고, 어긋났으면 바로 재설정 */
+    if (!s_valid || !whoami_ok() || !config_ok())
     {
         s_valid = (uint8_t)configure();
     }

@@ -50,7 +50,7 @@ USART2/USART3/SPI2/SPI3 는 CubeMX 가 아니라 **레지스터로 직접** 설�
 |---|---|---|---|
 | 터미널 / 조이스틱 | USART2 (ST-Link VCP) | PA2 TX, PA3 RX | 115200 8N1, RX 인터럽트 |
 | 조향 서보 버스 | USART3 반이중 | PB10 (오픈드레인+풀업) | 1 Mbps |
-| Pi 링크 | SPI2 슬레이브 + DMA1 S3/S4 | PB12 NSS, PB13 SCK, PC2 MISO, PC3 MOSI | 모드 0, 8비트, Pi 쪽 1 MHz 권장 (상한 8 MHz) |
+| Pi 링크 | SPI2 슬레이브 + DMA1 S3/S4 | PB12 CS (GPIO+EXTI, 소프트웨어 NSS), PB13 SCK, PC2 MISO, PC3 MOSI | 모드 0, 8비트, Pi 쪽 1 MHz 권장 (상한 8 MHz) |
 | IMU | SPI3 마스터 | PC10 SCK, PC11 MISO, PC12 MOSI, PC9 CS | 모드 0, 1 MHz |
 | 구동 MOTOR1 (LF) | TIM2 CH1/CH2 | PA5 / PB3 | MDD3A #1 M1 (A/B) |
 | 구동 MOTOR2 (LB) | TIM12 CH1/CH2 | PB14 / PB15 | MDD3A #1 M2 |

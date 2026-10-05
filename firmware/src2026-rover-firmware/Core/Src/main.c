@@ -559,6 +559,8 @@ static void read_sensors(void)
 {
   s_servo_valid = 0;
   int retried = 0;
+  /* 서보 응답 수신 중 Pi SPI 프레임 끝 ISR 이 끼면 USART3 오버런 -> 읽기 실패 */
+  PiSpi_HoldIrq(1);
   for (int m = 0; m < SWERVE_NUM_MODULES; m++)
   {
     if (s_servo_skip[m] > 0)
@@ -584,6 +586,7 @@ static void read_sensors(void)
       s_servo_skip[m] = SERVO_RETRY_TICKS;
     }
   }
+  PiSpi_HoldIrq(0);
   s_servo_read_err = (s_servo_valid != 0x0F);
 
   s_imu_valid = (uint8_t)Imu_Read(s_imu_raw);
@@ -765,6 +768,18 @@ static void process_command(const char *cmd)
     {
       printf("  배선(PB10/GND), 서보 전원(12V), 보레이트 1Mbps 확인 필요\r\n");
     }
+  }
+  /* --- "SPI" : Pi 링크 배선 진단 (단일 문자 "S" 분기보다 먼저) --- */
+  else if (cmd_is(cmd, "SPI"))
+  {
+    PiSpiStats_t st;
+    PiSpi_GetStats(&st);
+    printf("[SPI] CS에지 %lu 잡음 %lu | 완전 %lu 짧음 %lu | 마지막 %lu바이트 첫 %02X %02X | "
+           "파싱오류 %lu | 지금 PB12(CS)=%u PB13(SCK)=%u\r\n",
+           (unsigned long)st.cs_edges, (unsigned long)st.glitches, (unsigned long)st.full_frames,
+           (unsigned long)st.short_frames, (unsigned long)st.last_len,
+           st.last_head[0], st.last_head[1], (unsigned long)s_spi_rx_err,
+           st.nss_level, st.sck_level);
   }
   /* --- "S 200" : 이동 속도 설정 --- */
   else if (cmd[0] == 'S' || cmd[0] == 's')
@@ -1028,6 +1043,7 @@ static void print_help(void)
   printf("  ECHO         : 입력 문자 에코 on/off (기본 ON)\r\n");
   printf("  GATE         : 구동 정렬 게이트 on/off (기본 ON)\r\n");
   printf("  CTRL [ON|OFF]: 텔레옵 상태줄 (받은 vx vy w, 조향각, duty) 5Hz\r\n");
+  printf("  SPI          : Pi SPI 링크 진단 (CS 에지·수신 바이트·핀 레벨)\r\n");
   printf("  MTEST        : 모터 자가시험 on/off (기본 OFF, 바퀴 띄우고)\r\n");
   printf("  HELP         : 이 도움말\r\n");
   printf("========================================\r\n");
@@ -1163,9 +1179,9 @@ int main(void)
 
       /* 1a'. 센서 (항상. 텔레옵 전에도 Pi 가 볼 수 있다) */
       read_sensors();
-      if ((ctrl_tick % 50U) == 0U)
+      if ((ctrl_tick % 50U) == 0U || !s_imu_valid)
       {
-        Imu_Check();   /* 1초마다 WHO_AM_I 재확인 / 끊겼으면 재초기화 */
+        Imu_Check();   /* 1초마다 WHO_AM_I·설정 재확인. 무효가 되면 다음 주기에 바로 재설정 */
       }
 
       /* 1b. 제어주기 (텔레옵 중에만. 그 전에는 모터 자가시험·T 명령이 액추에이터를 쓴다) */

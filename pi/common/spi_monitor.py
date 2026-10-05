@@ -54,6 +54,7 @@ def main():
                     steer = " ".join(f"{math.degrees(a):6.1f}" if ok else "   ---"
                                      for a, ok in zip(tlm["steer_meas_rad"], tlm["servo_valid"]))
                     wheel = " ".join(f"{v:+.3f}" for v in tlm["wheel_mps"])
+                    enc = " ".join(f"{e:+7d}" for e in tlm["enc_ticks"])
                     imu = ("gyro " + " ".join(f"{g:+6.1f}" for g in tlm["gyro_dps"]) +
                            " acc " + " ".join(f"{a:+.2f}" for a in tlm["acc_g"])
                            if f & TLM_FLAG_IMU_VALID else "IMU ---")
@@ -61,7 +62,7 @@ def main():
                            ("G" if f & TLM_FLAG_GATE_PENDING else "-") + \
                            ("T" if f & TLM_FLAG_GATE_TIMEOUT else "-")
                     print(f"t={tlm['t_ms']:>8} tick={tlm['tick']:>3} [{tags}] "
-                          f"steer[{steer}] wheel[{wheel}] {imu} rx_err={tlm['rx_err']} dup={n_dup}")
+                          f"steer[{steer}] wheel[{wheel}] enc[{enc}] {imu} rx_err={tlm['rx_err']} dup={n_dup}")
             time.sleep(max(0.0, period - (time.monotonic() - t0)))
     except KeyboardInterrupt:
         pass

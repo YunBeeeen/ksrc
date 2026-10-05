@@ -3,7 +3,9 @@
  * @brief   Pi <-> Nucleo SPI2 슬레이브 링크 (DMA, 고정 길이 프레임)
  *
  * 핀 (rover_motor.ioc 와 동일):
- *   PB12 SPI2_NSS  (Pi CE0)   -- 하드웨어 NSS + 상승 에지 EXTI 로 프레임 경계 검출
+ *   PB12 GPIO 입력 (Pi CE0)   -- 상승 에지 EXTI 로 프레임 경계 검출. SPI2 는 소프트웨어 NSS
+ *                               (하드웨어 NSS 는 CS 잡음에 SCK 를 막아 비트가 밀렸다).
+ *                               EXTI 진입 후 PB12 가 실제로 High 일 때만 프레임 끝으로 본다.
  *   PB13 SPI2_SCK  (Pi SCLK)
  *   PC2  SPI2_MISO (Pi MISO)
  *   PC3  SPI2_MOSI (Pi MOSI)
@@ -55,8 +57,29 @@ uint8_t *PiSpi_TxBuffer(void);
 /** PiSpi_TxBuffer() 에 채운 프레임을 다음 SPI 전송에 쓰도록 넘긴다. */
 void PiSpi_CommitTx(void);
 
+/**
+ * @brief  CS 인터럽트를 잠시 미룬다 (1) / 다시 받는다 (0).
+ *         서보 응답(USART3 1Mbps 폴링, 바이트당 10us)을 읽는 동안 프레임 끝 ISR 이
+ *         끼어들면 수신 오버런으로 읽기가 깨진다 (Pi 주기와 맞물려 몇 초마다 반복).
+ */
+void PiSpi_HoldIrq(int hold);
+
 /** 길이가 맞지 않아 버린 전송 수 (CS 가 중간에 올라간 경우 등) */
 uint32_t PiSpi_ShortTransfers(void);
+
+/** 배선 진단용 누적 카운터 (부팅 후) */
+typedef struct {
+    uint32_t cs_edges;      /* 프레임 끝으로 인정한 CS 상승 에지 수 (0 이면 CE0->PB12 선 문제) */
+    uint32_t full_frames;   /* 144바이트를 다 받은 전송 수 */
+    uint32_t short_frames;  /* 일부만 받은 전송 수 */
+    uint32_t glitches;      /* 무시한 CS 잡음 에지 수 (많으면 배선 개선 필요) */
+    uint32_t last_len;      /* 마지막 전송에서 받은 바이트 수 (0 이면 SCLK->PB13 문제) */
+    uint8_t  last_head[2];  /* 마지막 수신 첫 두 바이트 (A5 5A 가 아니면 MOSI->PC3 문제) */
+    uint8_t  nss_level;     /* 지금 PB12 레벨 (Pi 유휴면 1) */
+    uint8_t  sck_level;     /* 지금 PB13 레벨 (Pi 유휴면 0) */
+} PiSpiStats_t;
+
+void PiSpi_GetStats(PiSpiStats_t *st);
 
 #ifdef __cplusplus
 }
