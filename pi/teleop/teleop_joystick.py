@@ -24,12 +24,15 @@ KSRC 스워브 로버용 화면 마우스 조이스틱 텔레옵.
   binary -> common/nucleo_link.py 의 프레임 프로토콜. 시뮬레이터의 가상
             Nucleo 가 쓰는 포맷.
 
-  spi    -> (--spi) Pi SPI0 -> Nucleo SPI2 로 spi_link 프레임 (CRC16). 라파에서 실주행용.
-            교환할 때마다 텔레메트리가 돌아오므로 --monitor 는 시리얼 없이 그걸 찍는다.
-            라파가 헤드리스라 창은 `ssh -X pi@raspberrypi.local` 로 PC 화면에 띄운다.
+  udp    -> (--udp HOST) PC 에서 창을 띄우고 vx, vy, ω 를 UDP 로 라파에 보낸다. 라파의
+            pi/common/udp_spi_bridge.py 가 받아서 SPI 로 Nucleo 에 넘긴다. 라파가 헤드리스라
+            이게 실주행 기본 경로 (ssh X 포워딩은 SDL MIT-SHM 오류로 창이 안 뜸).
+            --monitor 는 라파가 돌려주는 텔레메트리 요약을 찍는다.
+  spi    -> (--spi) 이 프로그램 자체를 라파에서 돌려 SPI 로 직접 보낸다 (라파에 화면이 있을 때).
 
 사용법:
-  python3 teleop_joystick.py --spi --rate 50 --max-lin 0.15 --max-ang 0.8 --monitor  # 라파 -> SPI
+  # 라파: python3 pi/common/udp_spi_bridge.py
+  python3 teleop_joystick.py --udp raspberrypi.local --rate 50 --max-lin 0.15 --max-ang 0.8 --monitor
   python3 teleop_joystick.py --port /dev/ttyACM0                 # 실제 로버 (USB 시리얼)
   python3 teleop_joystick.py --port /dev/pts/N --format binary   # 시뮬레이터
   python3 teleop_joystick.py --ros --max-lin 0.25 --max-ang 0.8 # ROS2 대회맵
@@ -140,6 +143,34 @@ def run(args):
     if ros_mode:
         sink = RosSink(getattr(args, "topic", "/cmd_vel"))
         send = sink.send
+    elif getattr(args, "udp", None):
+        import json
+        import socket
+        import struct
+        host, _, port = args.udp.partition(":")
+        dest = (socket.gethostbyname(host), int(port or 5005))
+        usock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        usock.setblocking(False)
+        pkt = struct.Struct("<4sIfff")
+        useq = 0
+        print(f"[udp] -> {dest[0]}:{dest[1]} (라파에서 udp_spi_bridge.py 실행 중이어야 함)")
+
+        def send(vx, vy, omega):
+            nonlocal useq, last_tlm
+            useq = (useq + 1) & 0xFFFFFFFF
+            try:
+                usock.sendto(pkt.pack(b"KSRC", useq, vx, vy, omega), dest)
+            except OSError:
+                pass
+            while True:   # 라파가 돌려준 텔레메트리 요약 (5Hz)
+                try:
+                    data, _ = usock.recvfrom(2048)
+                except (BlockingIOError, OSError):
+                    break
+                try:
+                    last_tlm = json.loads(data)
+                except ValueError:
+                    pass
     elif spi_mode:
         from common.nucleo_link import SpiLink
         link = SpiLink(args.spi_bus, args.spi_dev, args.spi_speed)
@@ -158,10 +189,12 @@ def run(args):
         send = lambda vx, vy, omega: ser.write(encode(vx, vy, omega))
 
     # --monitor: STM 이 받은 값을 되돌려 찍게 하고(CTRL ON), 보낸 값과 나란히 출력한다.
+    udp_mode = bool(getattr(args, "udp", None))
+    tlm_mode = spi_mode or udp_mode   # 텔레메트리를 직접 받는 모드 (시리얼 CTRL 불필요)
     monitor = getattr(args, "monitor", False) and not ros_mode
     rx_buf = b""
     next_mon = time.monotonic()
-    if monitor and spi_mode:
+    if monitor and tlm_mode:
         print("[monitor] PI > 는 보낸 값, STM> 는 STM 이 실제 적용한 명령·조향·duty (SPI 텔레메트리, 5Hz)")
     elif monitor:
         ser.write(b"CTRL ON\n")
@@ -234,7 +267,7 @@ def run(args):
                 send(vx, vy, omega)
                 next_send = now + period
 
-            if monitor and spi_mode:
+            if monitor and tlm_mode:
                 if now >= next_mon:
                     print(f"PI > v {vx + 0.0:+.3f} {vy + 0.0:+.3f} {omega + 0.0:+.3f}")
                     if last_tlm is not None:
@@ -242,10 +275,12 @@ def run(args):
                         f = t["flags"]
                         tags = ("W" if f & TLM_FLAG_WATCHDOG else "-") + \
                                ("G" if f & TLM_FLAG_GATE_PENDING else "-")
-                        deg = " ".join(f"{math.degrees(a):+6.1f}" for a in t["steer_cmd_rad"])
+                        degs = t["deg"] if "deg" in t else [math.degrees(a) for a in t["steer_cmd_rad"]]
+                        deg = " ".join(f"{a:+6.1f}" for a in degs)
                         duty = " ".join(f"{d:+4d}" for d in t["duty"])
                         print(f"STM> v {t['cmd'][0] + 0.0:+.3f} {t['cmd'][1] + 0.0:+.3f} {t['cmd'][2] + 0.0:+.3f} "
-                              f"| deg {deg} | duty {duty} [{tags}] crc_bad={n_spi_bad}")
+                              f"| deg {deg} | duty {duty} [{tags}] "
+                              f"crc_bad={t.get('crc_bad', n_spi_bad)}{' STALE' if t.get('stale') else ''}")
                     else:
                         print(f"STM> (아직 유효 프레임 없음, crc_bad={n_spi_bad})")
                     next_mon = now + 0.2
@@ -273,10 +308,11 @@ def run(args):
             help_text = "drag pads with mouse | Q/E rotate | space=stop | Esc=quit"
             screen.blit(font.render(readout, True, (220, 220, 230)), (16, 16))
             screen.blit(font.render(help_text, True, (140, 140, 150)), (16, 44))
-            if spi_mode:
+            if tlm_mode:
                 if last_tlm is not None:
                     c = last_tlm["cmd"]
-                    stm = f"STM got vx={c[0]:+.2f} vy={c[1]:+.2f} omega={c[2]:+.2f}  crc_bad={n_spi_bad}"
+                    stm = (f"STM got vx={c[0]:+.2f} vy={c[1]:+.2f} omega={c[2]:+.2f}  "
+                           f"crc_bad={last_tlm.get('crc_bad', n_spi_bad)}")
                 else:
                     stm = f"STM: no valid frame yet  crc_bad={n_spi_bad}"
                 screen.blit(font.render(stm, True, (120, 220, 140)), (16, HEIGHT - 30))
@@ -289,6 +325,8 @@ def run(args):
             time.sleep(0.02)
         if ros_mode:
             sink.close()
+        elif getattr(args, "udp", None):
+            usock.close()
         elif spi_mode:
             link.close()
         else:
@@ -301,6 +339,8 @@ def main():
     ap.add_argument("--port", default="/dev/ttyACM0",
                     help="serial device to the Nucleo (ST-Link VCP is usually /dev/ttyACM0)")
     ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--udp", metavar="HOST[:PORT]",
+                    help="PC 창 -> UDP -> 라파 udp_spi_bridge.py -> SPI (기본 포트 5005)")
     ap.add_argument("--spi", action="store_true",
                     help="시리얼 대신 Pi SPI0 -> Nucleo SPI2 로 보낸다 (라파에서 실행)")
     ap.add_argument("--spi-bus", type=int, default=0)

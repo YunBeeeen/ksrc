@@ -218,11 +218,16 @@ python3 pi/teleop/teleop_joystick.py --port /dev/ttyACM0 --max-lin 0.15 --max-an
 ```
 
 ```bash
-# 라파에서 (PC 에서 ssh -X pi@raspberrypi.local 로 접속, SPI 로 Nucleo 와 통신)
+# 라파에서 (ssh pi@raspberrypi.local, SPI 로 Nucleo 와 통신)
 cd ~/ksrc
 python3 pi/common/spi_monitor.py         # 텔레메트리 확인 (명령 안 보냄)
 python3 pi/common/imu_check.py           # IMU 축·부호 확인 (로버 좌표)
-python3 pi/teleop/teleop_joystick.py --spi --rate 50 --max-lin 0.15 --max-ang 0.8 --monitor
+python3 pi/common/udp_spi_bridge.py      # PC 조이스틱 -> SPI 중계 (켜 둔다)
+```
+
+```bash
+# PC 에서 (조이스틱 창은 PC, 라파가 받아 SPI 로 전달)
+python3 pi/teleop/teleop_joystick.py --udp raspberrypi.local --rate 50 --max-lin 0.15 --max-ang 0.8 --monitor
 ```
 
 ---

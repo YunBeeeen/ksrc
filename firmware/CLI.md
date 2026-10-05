@@ -242,19 +242,22 @@ python3 pi/common/imu_check.py      # 2초 정지 보정 후 10Hz: acc, |acc|, r
 `IMU_CHIP_TO_BODY` (현재 칩이 z 기준 180° 장착 → x, y 반대). 정상: 정지 시 acc ≈ 0 0 +1,
 반시계 90° → 셋째 누적 ≈ +90, 앞을 숙이면 pitch +. Enter = 누적각 리셋.
 
-### 조이스틱 주행 (라파 → SPI)
-라파는 화면이 없으므로 창을 PC 로 가져온다 (X11 포워딩).
+### 조이스틱 주행 (PC 창 → 라파 → SPI)
+라파는 화면이 없고, ssh X 포워딩(`-X`/`-Y`)으로는 pygame 창이 MIT-SHM 오류로 안 뜬다.
+그래서 **창은 PC**, **Nucleo 통신은 라파**가 맡는다. PC 와 라파는 같은 와이파이.
 ```bash
-# PC 에서 (-X 가 창 포워딩)
-ssh -X pi@raspberrypi.local
-# 라파에서. 처음 한 번: sudo apt install -y python3-pygame
+# 1) 라파 (ssh pi@raspberrypi.local)
+cd ~/ksrc && git pull
+python3 pi/common/udp_spi_bridge.py          # UDP 5005 -> SPI 50Hz 중계
+
+# 2) PC (새 터미널)
 cd ~/ksrc
-python3 pi/teleop/teleop_joystick.py --spi --rate 50 --max-lin 0.15 --max-ang 0.8 --monitor
+python3 pi/teleop/teleop_joystick.py --udp raspberrypi.local --rate 50 --max-lin 0.15 --max-ang 0.8 --monitor
 ```
-조작·인자는 5 와 같다. `--spi` 는 USB 시리얼 대신 SPI 로 보내고, 교환할 때마다 돌아오는
-텔레메트리로 `STM>` 줄(STM 이 실제 적용한 v, 조향각, duty)과 창 아래 초록 줄을 찍는다.
-`--rate` 는 SPI 라 50 까지 문제없다 (시리얼은 20). `crc_bad` 가 늘면 위 배선 확인.
-창이 끊기면(와이파이) 명령도 멈추고 STM 워치독이 500ms 뒤 정지시킨다.
+조작·인자는 5 와 같다. `--monitor` 의 `STM>` 줄과 창 아래 초록 줄은 라파가 돌려주는 텔레메트리
+(STM 이 실제 적용한 v, 조향각, duty). 라파 화면에는 `[PC주소] 보냄 v ... rx= drop= crc_bad=` 가 0.5초마다.
+안전: PC 명령이 0.3초 끊기면 라파가 0 을 보내고(`끊김->0`), 라파까지 끊기면 STM 워치독(500ms)이 정지.
+라파는 받은 값을 `--max-lin 0.32 --max-ang 2.0` 으로 한 번 더 자른다.
 
 ---
 
@@ -273,5 +276,5 @@ python3 pi/teleop/teleop_joystick.py --spi --rate 50 --max-lin 0.15 --max-ang 0.
 | `IMU ... 응답 없음` (부팅 메시지) | SPI3 배선, CS = PC9 확인. 1초마다 재시도함 |
 | Pi `[BAD]` 계속 / `SPI` 파싱오류 증가 | SCLK 선을 MOSI·MISO 와 분리, Pi 핀25 GND 직결 (6 참고) |
 | IMU 세 축이 같은 값 / 가끔 튐 | SPI3 잡음. 펌웨어가 즉시 무효 처리·재설정. 잦으면 PC10(SCK) 선 분리 |
-| `cannot open display` (조이스틱 --spi) | `ssh -X` 로 접속했는지 확인 |
+| 조이스틱 `STM>` 가 안 나옴 (--udp) | 라파에서 `udp_spi_bridge.py` 실행 중인지, 같은 와이파이인지 |
 | 조향이 너무 빠름 | `S 1500` 등으로 제한 |
