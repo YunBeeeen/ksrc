@@ -1,14 +1,13 @@
 """KSRC 스워브 로버 Gymnasium 환경.
 
-액션은 **IK 위의 제한된 잔차** 8차원이다 (raw 바퀴 명령이 아님):
-    theta_i = IK_theta_i(vx,vy,w) + a[i]   * CLIP_STEER
-    duty_i  = IK_speed_i(vx,vy,w) + a[4+i] * CLIP_DUTY
+액션은 기본 차체 명령 위의 제한된 3차원 잔차다 (raw 바퀴 명령이 아님):
+    cmd_applied = cmd_nom + action * (d_vx_max, d_vy_max, d_om_max)
+    (theta_i, wheel_speed_i) = IK(cmd_applied)
 IK 는 펌웨어에 실제로 올라가는 C 코드(firmware/common/swerve_kinematics.c)를
 ctypes 로 호출한다.  파이썬으로 재구현하면 언젠가 반드시 어긋나고, 그러면
 잔차 정책이 통째로 무의미해진다.
 
-구동 명령을 duty 로 주는 것도 펌웨어와 맞춘 것이다 -- 실기체는 바퀴 속도를
-폐루프로 제어하지 않고 PWM duty 를 열어준다 (mdd3a_normalize_speed).
+현재 시뮬의 저수준 구동은 wheel_speed_i 를 개루프 duty 로 변환한다.
 """
 import sys, pathlib
 import numpy as np
@@ -22,7 +21,8 @@ import ksrc_common as kc
 from config import RoverCfg, NoiseCfg, sample
 from mjcf import build
 from terramech import Terramechanics, PRESETS as TERRAIN_PRESETS, sample_terrain
-from reward import RewardCfg, tracking_terms
+from reward import (RewardCfg, VelRewardCfg, tracking_terms,
+                    recovery_potential, velocity_terms)
 import terrain as terr
 import path as pth
 
@@ -37,7 +37,7 @@ C2MJ = [MJ_WHEELS.index(w) for w in C_ORDER]  # C 인덱스 -> MJCF 인덱스
 
 # cmd_nom 3 + wheel_ref_applied_prev 4 + wheel_meas 4 + steer 4
 # + roll/pitch 2 + gyro 3 + acc 3 + lookahead 2점 4 + e_y 1 + cos/sin(e_psi) 2
-# + prev_action 3  =  33
+# + 선행 목표점 2 + 선행 거리 1 + prev_action 3  =  36
 #
 # e_y 와 cos/sin(e_psi) 를 **직접** 넣는다.  lookahead 점만 주고 네트워크가 유도하길
 # 기대했는데, 2026 4WIS 논문은 추종오차를 명시적으로 넣는다.  lookahead 는 경로
@@ -47,7 +47,7 @@ C2MJ = [MJ_WHEELS.index(w) for w in C_ORDER]  # C 인덱스 -> MJCF 인덱스
 #
 # prev_action 은 보상의 2차 차분(Delta^2 a) 때문에 필요하다.  정책이 자기 직전
 # 행동을 모르면 매끄러움을 맞출 수가 없다.
-OBS_PER_FRAME = 33
+OBS_PER_FRAME = 36
 # 경로를 관측에 넣지 않으면 횡이탈을 **원리적으로** 관측할 수 없어 경로추종
 # 보상이 학습 불가능하다 (기존 23차원에는 자기 위치도 경로도 없었다).
 # 실기에서는 Nav2 local plan + TF 로 얻는다 -> 측위 오차를 노이즈로 섞는다.
@@ -71,11 +71,41 @@ class RoverEnv(gym.Env):
                  noise: NoiseCfg = None, seed: int = None,
                  perturb: float = 0.0, paths=None, s0_frac=None,
                  spawn_max_slope_deg: float = None,
-                 drive_align_gate_deg: float = 10.0):
+                 drive_align_gate_deg: float = 10.0,
+                 soil_amp: float = None,
+                 task: str = "path",
+                 discount_gamma: float = 0.998):
         self.base_cfg = cfg or RoverCfg()
         self.rew = rew or RewardCfg()
+        # "path"  : pure pursuit 를 따라가는 경로추종 (align/prog/gate 보상)
+        # "cmdvel": 주어진 차체속도를 변형지형에서 달성하는 **밑단** 과제.
+        #           경로 항은 계산하지 않는다 (코드는 아래 _reward 에 남겨둠).
+        if task not in ("path", "cmdvel"):
+            raise ValueError("task 는 'path' 또는 'cmdvel' 이어야 합니다")
+        self.task = task
+        self.vel_rew = VelRewardCfg()
+        # cmd_vel 스케줄: 2초마다 새 목표를 뽑고 0.3초 1차 필터로 수렴시킨다.
+        # 계단 명령을 그대로 주면 오차의 대부분이 플랜트 지연(잔차로 못 고침)이
+        # 되어 학습 신호가 흐려진다.
+        self.cmd_hold = int(2.0 * CTRL_HZ)
+        self.cmd_a = 1.0 / (0.3 * CTRL_HZ)
+        self.cmd_tgt = np.zeros(3)
+        self.cmd_cur = np.zeros(3)
+        self._cmd_k = 0
+        self.vel_err_hist = []
+        if not 0.0 < discount_gamma <= 1.0 or not np.isfinite(discount_gamma):
+            raise ValueError("discount_gamma 는 (0, 1] 범위여야 합니다")
+        self.discount_gamma = float(discount_gamma)
         self.difficulty = difficulty
         self.randomize = randomize
+        # 모래 비대칭 장(soil_field)은 **이 RL 의 과제 본체**다 (terrain.soil_field
+        # docstring 참고).  그런데 `--stage1` 은 randomize 를 통째로 끄면서 이것까지
+        # 꺼버려서, s9/s10 은 "교란이 없는 세계" 에서 학습·평가됐다 (외란이 없으면
+        # 최적 잔차가 a=0, 즉 순수 IK 가 정답이라 정책이 이길 수 없다).
+        # soil_amp 를 명시하면 randomize 와 무관하게 이 항만 켠다.
+        if soil_amp is not None and (not np.isfinite(soil_amp) or soil_amp < 0):
+            raise ValueError("soil_amp 는 0 이상의 유한한 숫자여야 합니다")
+        self.soil_amp_override = None if soil_amp is None else float(soil_amp)
         self.arena_eval = arena_eval          # True 면 실제 경기장 지형으로 평가
         self.eval_kind = eval_kind            # "sand"(규사 경사지형) / "rock"(착륙지)
         # 대회맵으로 **학습**할 때 쓴다: 거시 구조는 그대로 두고 미세 요철만
@@ -89,9 +119,6 @@ class RoverEnv(gym.Env):
         self.nz = noise or NoiseCfg()
         self.rng = np.random.default_rng(seed)
         self.episode_steps = int(episode_s * CTRL_HZ)
-
-        self.clip_steer = np.radians(10.0)    # 잔차 상한 -- ablation 손잡이
-        self.clip_duty = 0.60          # 0.2 로는 모래에서 감속 여유가 부족했다
 
         n_obs = OBS_PER_FRAME * HISTORY + (PRIV_DIM if privileged else 0)
         self.observation_space = spaces.Box(-np.inf, np.inf, (n_obs,), np.float32)
@@ -143,8 +170,19 @@ class RoverEnv(gym.Env):
 
         # 펌웨어 C 에 넘길 모듈 좌표 (C 순서)
         self.c_modules = kc._make_modules(half_w=c.track / 2, half_l=c.axle_x)
+        # 제자리 회전의 기하 한계.  요 오차를 무차원화할 기준이다
+        # (omega_max = v_max / 모듈 최대반경).  v_max 는 아래에서 정해지므로
+        # 여기서는 반경만 잡아둔다.
+        self.mod_r = max(float(np.hypot(mm.x, mm.y)) for mm in self.c_modules)
+        # 바퀴별 조향 가동범위 (config.steer_*_deg). C 순서는 fold 용, MJCF 순서는 clip 용.
+        rng_c = [c.steer_range_rad(w) for w in C_ORDER]
+        self.st_lo_c = [r[0] for r in rng_c]
+        self.st_hi_c = [r[1] for r in rng_c]
+        self.st_lo_mj = np.array([c.steer_range_rad(w)[0] for w in MJ_WHEELS])
+        self.st_hi_mj = np.array([c.steer_range_rad(w)[1] for w in MJ_WHEELS])
         self.c_state = (kc.SwerveModuleState * 4)()
         self.v_max = c.mot_w_noload * c.wheel_r
+        self.om_max = self.v_max / max(self.mod_r, 1e-9)
 
     # ------------------------------------------------------------------ 명령
     def _new_path(self):
@@ -163,11 +201,12 @@ class RoverEnv(gym.Env):
                 self.path_set[int(self.rng.integers(len(self.path_set)))])
             self.s0 = float(getattr(self, "_pending_s0", 0.0))
         else:
-            self.path = pth.make_path(self.drive, self.hf_Z, self.hf_ex, self.hf_ey,
-                                      self.rng, self.d.qpos[:2].copy(),
-                                      slope_deg=self.slope_deg, d_ep=self.d_ep)
+            self.path = self._pending_generated
             self.s0 = 0.0
         self.path_c = pth.clone(self.path)
+        start_xy = self.d.qpos[:2].copy()
+        self.path.seed(self.s0, start_xy)
+        self.path_c.seed(self.s0, start_xy)
         self.s_path = self.s0
         self.s_est = self.s0
         self.e_y = 0.0
@@ -188,8 +227,11 @@ class RoverEnv(gym.Env):
         pos = self.d.qpos[:2].copy()
         # 진행도 증가는 **실제 변위로 상한**된다 (path.project 주석 참고).
         self.s_path, self.e_y, _ = self.path.project(pos)
-        # 경로 기준 차체 기수오차. 관측·진단과 legacy 보상에만 쓴다.
-        self.e_psi = _wrap(self._yaw() - pth.heading_at(self.path, self.s_path))
+        # 경로 기준 참 차체 기수오차. 보상·진단에 쓰고 관측은 추정치를 쓴다.
+        # 기준은 **제어기가 요 명령을 내는 방향**(course_at) 이다. 접선을 쓰면
+        # 꼭짓점 앞 선행 조향이 오차로 기록되어 보상이 옳은 행동을 벌한다.
+        self.e_psi = _wrap(self._yaw()
+                           - pth.course_at(self.path, self.s_path, self.pp_L))
         # 완주 = 종방향 잔여 + 목표점 실거리 둘 다.  잔여거리만 보면 경로를 크게
         # 벗어난 상태에서도 완주로 잡힌다 (직선 끝에서 1.02m 벗어난 점이 완주였다).
         self.goal_dist = float(np.linalg.norm(pos - self.path.P[-1]))
@@ -222,7 +264,9 @@ class RoverEnv(gym.Env):
             yaw_est = yaw + self.yaw_lp
         else:
             pos_est, yaw_est = pos, yaw
-        self.s_est, _, _ = self.path_c.project(pos_est)
+        self.s_est, self.e_y_est, _ = self.path_c.project(pos_est)
+        self.e_psi_est = _wrap(
+            yaw_est - pth.course_at(self.path_c, self.s_est, self.pp_L))
         cmd = pth.pursue(self.path_c, self.s_est, pos_est, yaw_est, self.v_cruise,
                          k_v=self.cfg.pp_k_v, L_min=self.cfg.pp_l_min,
                          L_max=self.cfg.pp_l_max)
@@ -235,6 +279,65 @@ class RoverEnv(gym.Env):
         self.cmd_nom = cmd
         # 관측용 lookahead 도 같은 추정치에서 나온다 (같은 map->odom TF).
         self.wp_b = pth.lookahead_body(self.path_c, self.s_est, pos_est, yaw_est)
+        # 기존 0.30/0.80m 샘플은 경로 모양을, 이 점은 제어기의 실제
+        # 선행 목표점을 나타낸다. 속도에 따라 L 이 달라도 정책이 구분한다.
+        self.target_L = self.pp_L
+        self.target_b = pth.lookahead_body(
+            self.path_c, self.s_est, pos_est, yaw_est, dists=(self.target_L,))[0]
+
+        if self.task == "cmdvel":
+            # pure pursuit 의 출력을 **버리고** 랜덤 twist 로 교체한다.  위
+            # 경로 계산은 관측 차원(36D)을 유지하기 위해 남겨두지만 아래에서
+            # 0 으로 덮으므로 보상·명령 어디에도 들어가지 않는다.
+            if self._cmd_k % self.cmd_hold == 0:
+                self.cmd_tgt = self.sample_cmd()
+            self._cmd_k += 1
+            self.cmd_cur = self.cmd_cur + self.cmd_a * (self.cmd_tgt - self.cmd_cur)
+            self.cmd_nom = self.cmd_cur.copy()
+            # 경로 관측을 0 으로 막는다.  측위에 의존하는 특징을 남기면 밑단
+            # 정책이 경로/측위에 결합되어 "상위 제어기와 분리" 가 깨진다.
+            self.wp_b = np.zeros_like(self.wp_b)
+            self.e_y_est = 0.0
+            self.e_psi_est = 0.0
+            self.target_b = np.zeros_like(self.target_b)
+            self.target_L = 0.0
+
+    # ------------------------------------------------------- cmdvel 과제
+    def body_twist(self):
+        """차체좌표 실제 (vx, vy, omega).  추종오차의 '실제' 쪽이다."""
+        q = self.d.qpos[3:7]
+        Rm = np.zeros(9); mujoco.mju_quat2Mat(Rm, q); Rm = Rm.reshape(3, 3)
+        v_b = Rm.T @ self.d.qvel[:3]
+        om_b = Rm.T @ self.d.qvel[3:6]
+        return np.array([v_b[0], v_b[1], om_b[2]])
+
+    def sample_cmd(self):
+        """도달 가능한 랜덤 twist.
+
+        IK 포화는 "명령 자체가 불가능" 한 경우를 만들어 추종오차 측정을
+        오염시킨다 (정책도 못 고친다).  바퀴 요구속도를 v_max 의 90% 로
+        공통 스케일해서 **항상 도달 가능한 명령만** 준다.
+        """
+        r = self.rng
+        v = self.v_max
+        c = np.array([r.uniform(-0.9, 0.9) * v,
+                      r.uniform(-0.5, 0.5) * v,
+                      r.uniform(-1.0, 1.0) * 0.8])
+        need = max(np.hypot(c[0] - c[2] * mm.y, c[1] + c[2] * mm.x)
+                   for mm in self.c_modules)
+        if need > 0.9 * v:
+            c *= 0.9 * v / need
+        return c
+
+    def _cmdvel_terms(self, a):
+        """속도추종 보상.  오차는 v_max / omega_max 로 무차원화한다."""
+        tw = self.body_twist()
+        cmd = self.cmd_nom
+        v_err = float(np.linalg.norm(tw[:2] - cmd[:2])) / max(self.v_max, 1e-9)
+        om_err = abs(float(tw[2] - cmd[2])) / max(self.om_max, 1e-9)
+        self.vel_err_hist.append((v_err, om_err))
+        return velocity_terms(v_err, om_err, a, self.a_prev, self.a_prev2,
+                              self.vel_rew)
 
     def _ik_of(self, cmd):
         """cmd_vel -> (조향각[4], 바퀴속도 기준[4] m/s).  **펌웨어와 같은 C 코드.**
@@ -245,7 +348,7 @@ class RoverEnv(gym.Env):
         """
         out = kc.swerve_ik_compute(float(cmd[0]), float(cmd[1]), float(cmd[2]),
                                    self.c_modules, self.v_max, self.c_state)
-        kc.swerve_fold_to_limit(float(self.cfg.steer_lim), self.c_state, out,
+        kc.swerve_fold_to_range(self.st_lo_c, self.st_hi_c, self.c_state, out,
                                 unwind_rad=0.0, slow_mps=0.0)
         th = np.zeros(4); v = np.zeros(4)
         for ci, mi in enumerate(C2MJ):
@@ -258,10 +361,6 @@ class RoverEnv(gym.Env):
         """커리큘럼 콜백이 SubprocVecEnv.env_method 로 호출한다."""
         self.difficulty = float(np.clip(d, 0.0, 1.0))
         return self.difficulty
-
-    def set_clip(self, steer_deg: float, duty: float):
-        """ablation 손잡이: (10,0.2)=8-D / (0,0.2)=속도만 / (0,0)=순수 IK."""
-        self.clip_steer = np.radians(steer_deg); self.clip_duty = duty
 
     # ------------------------------------------------------------ 구동/센싱 노이즈
     def _sample_noise(self):
@@ -331,8 +430,10 @@ class RoverEnv(gym.Env):
             [roll / (np.pi / 2), pitch / (np.pi / 2)],
             gyro / 5.0, acc / 9.81,
             np.clip(self.wp_b.ravel() / 1.0, -2.0, 2.0),   # lookahead 2점 (m)
-            [np.clip(self.e_y / 0.3, -3.0, 3.0)],          # 횡이탈
-            [np.cos(self.e_psi), np.sin(self.e_psi)],      # 기수오차 (2pi 불연속 제거)
+            [np.clip(self.e_y_est / 0.3, -3.0, 3.0)],      # 측위 추정치의 횡이탈
+            [np.cos(self.e_psi_est), np.sin(self.e_psi_est)],  # 측위 추정 기수오차
+            np.clip(self.target_b, -2.0, 2.0),           # 제어기 선행 목표점 (차체좌표)
+            [self.target_L],                             # 경로상 선행 거리 (m)
             self.a_prev,                                   # 직전 행동 3D
         ]).astype(np.float32)
 
@@ -417,8 +518,13 @@ class RoverEnv(gym.Env):
         self.hf_Z = Z; self.hf_ex = 2 * hx; self.hf_ey = 2 * hy; self.hf_off = z_off
         # 경사 상한은 로버 견인력 예산에서 유도된다 (config.max_slope_deg 주석).
         self.drive, self.slope_deg = terr.drivable_mask(
-            Z, self.hf_ex, self.hf_ey, max_slope_deg=self.cfg.max_slope_deg)
-        spawn_drive = self.drive
+            Z, self.hf_ex, self.hf_ey, max_slope_deg=self.cfg.max_slope_deg,
+            max_step=self.cfg.max_step)
+        self.route_drive = terr.center_clearance_mask(
+            self.drive, self.hf_ex, self.hf_ey, self.cfg.route_clearance)
+        if not self.route_drive.any():
+            raise RuntimeError("로버 크기를 반영한 주행 가능 경로가 없습니다")
+        spawn_drive = self.route_drive
         if self.spawn_max_slope_deg is not None:
             # 중심만 평탄하면 바퀴가 경사에 걸친 채 시작할 수 있다. 차체 방향에
             # 상관없이 바퀴 바깥쪽까지 들어가는 반경만큼 경사 경계를 비운다.
@@ -426,11 +532,12 @@ class RoverEnv(gym.Env):
                                         self.cfg.track / 2 + self.cfg.wheel_r))
             spawn_drive = terr.flat_spawn_mask(
                 self.drive, self.slope_deg, self.hf_ex, self.hf_ey,
-                self.spawn_max_slope_deg, clearance)
+                self.spawn_max_slope_deg, clearance) & self.route_drive
             if not spawn_drive.any():
                 raise RuntimeError("평탄한 스폰 후보가 없습니다: 지형 또는 경사 상한을 확인하세요")
         if self.path_set:
             # 경로 위 s0 에서 시작한다.  경로를 먼저 고르고 그 지점으로 스폰.
+            self._pending_generated = None
             base = self.path_set[int(self.rng.integers(len(self.path_set)))]
             self._pending = pth.clone(base)
             s0 = (float(self.rng.uniform(0.0, 0.6 * self._pending.total))
@@ -440,8 +547,20 @@ class RoverEnv(gym.Env):
             self._pending_s0 = s0
         else:
             self._pending = None
-            spawn = terr.sample_drivable(spawn_drive, Z, self.hf_ex, self.hf_ey,
-                                         self.rng, 1)[0]
+            # 안전 마스크의 아주 작은 포켓은 출발점만 유효하고 0.5m 앞도
+            # 막힐 수 있다(특히 rock). 실제로 갈 수 있는 경로를 찾은 뒤 스폰한다.
+            for _ in range(100):
+                spawn = terr.sample_drivable(spawn_drive, Z, self.hf_ex, self.hf_ey,
+                                             self.rng, 1)[0]
+                try:
+                    self._pending_generated = pth.make_path(
+                        self.route_drive, Z, self.hf_ex, self.hf_ey, self.rng, spawn,
+                        slope_deg=self.slope_deg, d_ep=self.d_ep)
+                    break
+                except ValueError:
+                    continue
+            else:
+                raise RuntimeError("안전한 스폰·경로를 찾지 못했습니다: 지형과 로버 크기를 확인하세요")
         z_top = terr.local_top(Z, self.hf_ex, self.hf_ey, spawn) + z_off
 
         mujoco.mj_resetData(self.m, self.d)
@@ -458,12 +577,18 @@ class RoverEnv(gym.Env):
         # 주는 "계속 변하는 속도 명령"을 재현한다.
         self.goals = 0
         self.v_cruise = self.rng.uniform(0.45, 1.0) * self.v_max
+        # 제어기 선행거리.  에피소드 안에서 상수이고, 요 기준(course_at)·관측·
+        # 보상·스폰 자세가 **전부 이 하나**를 공유한다.
+        self.pp_L = pth.pursuit_distance(
+            self.v_cruise, self.cfg.pp_k_v, self.cfg.pp_l_min, self.cfg.pp_l_max)
         self._new_path()
-        # 스폰 자세는 **s0 지점의 local path heading** 기준이다 (경로 시작방향이
-        # 아니다 -- 중간에서 스폰하면 그건 틀린 기준).  heading_at 과 같은 정의.
+        # 스폰 자세는 **s0 지점에서 제어기가 요구할 방향** 기준이다 (경로
+        # 시작방향이 아니다 -- 중간에서 스폰하면 그건 틀린 기준).  pursue 의 요
+        # 명령과 같은 course_at 을 쓴다.  접선(heading_at)으로 스폰하면 꼭짓점
+        # 근처에서 시작할 때 제어기 기준으로 이미 틀어진 자세가 된다.
         # 실기에서도 nav2 는 rotation_shim_controller 로 큰 초기 요 오차를 먼저
         # 없앤 뒤 경로추종에 들어가므로 +-30도 로 좁힌다.
-        yaw0 = pth.heading_at(self.path, self.s0) + float(
+        yaw0 = pth.course_at(self.path, self.s0, self.pp_L) + float(
             self.rng.uniform(-np.pi / 6, np.pi / 6))
         self.d.qpos[3:7] = [np.cos(yaw0 / 2), 0.0, 0.0, np.sin(yaw0 / 2)]
         self.wp_b = np.zeros((2, 2))
@@ -485,13 +610,19 @@ class RoverEnv(gym.Env):
         # 모았다 (slip/sink/e_y/yaw/energy).  f_belly 같은 누적 비율과 의미가
         # 달라 한 표에 섞여 있었다.  평균·p90·최대를 전부 남긴다.
         self.acc = {k: [] for k in ("slip", "sink", "e_y", "yaw", "pw", "prog",
-                                    "e_psi", "course")}
+                                    "e_psi", "course",
+                                    # cmdvel 과제의 **본 지표**.  무차원
+                                    # (v_max / om_max 로 나눈 값) 이다.
+                                    "v_err", "om_err")}
         self.n_duty_sat = 0.0; self.duty_lost = 0.0; self.duty_use = 0.0
         self.n_drive_gated = 0.0
         self.n_steer_sat = 0.0; self.steer_use = 0.0
         # 3D 잔차 진단: 명령 포화율 / 바퀴 desaturation 율 / 권한 사용률
         self.n_cmd_sat = 0.0; self.n_wheel_desat = 0.0
         self.a_use = 0.0; self.a_p95 = []
+        self._cmd_k = 0
+        self.cmd_tgt = np.zeros(3); self.cmd_cur = np.zeros(3)
+        self.vel_err_hist = []
         self.wheel_ref_applied = np.zeros(4)
         self.drive_alignment_pending = False
         self.cmd_nom = np.zeros(3)
@@ -503,18 +634,24 @@ class RoverEnv(gym.Env):
             self.tm.apply(self.d, self.m.opt.timestep); mujoco.mj_step(self.m, self.d)
         self.tm.reset()
         # **바퀴별 흙 차이.**  난이도에 비례해 비대칭을 키운다 (d=0 이면 균일).
-        # 상관길이는 트랙폭(236.7mm)보다 조금 작게 둬서 좌우 바퀴가 서로 다른 값을
+        # 상관길이는 트랙폭(265mm)보다 조금 작게 둬서 좌우 바퀴가 서로 다른 값을
         # 밟고, 패치를 넘어갈 때 과도 외란이 생긴다.  **tm.reset() 이 mu_field 를
         # 지우므로 반드시 그 뒤에 넣어야 한다** (처음에 앞에 뒀다가 안 먹었다).
-        if self.randomize and self.cfg.soil_amp > 0:
+        if self.soil_amp_override is not None:
+            soil_amp = self.soil_amp_override       # 명시값이 randomize 를 이긴다
+        else:
+            soil_amp = self.cfg.soil_amp if self.randomize else 0.0
+        if soil_amp > 0:
             self.tm.mu_field = terr.soil_field(
                 self.hf_ex, self.hf_ey, self.rng,
-                amp=self.cfg.soil_amp * self.d_ep, lam=self.cfg.soil_lam)
+                amp=soil_amp * self.d_ep, lam=self.cfg.soil_lam)
             self.tm.f_ex, self.tm.f_ey = self.hf_ex, self.hf_ey
         # 정착으로 위치가 조금 움직이지만 project 가 단조로 흡수한다.
         # 여기서 _new_path 를 다시 부르면 위에서 자세를 맞춘 경로와 **다른**
         # 경로가 되어 초기 요 오차 정렬이 무의미해진다.
         self._project_truth()            # 참값 경로 상태
+        self.route_dist_prev = self.path.distance(self.d.qpos[:2])
+        self.last_xy = self.d.qpos[:2].copy()  # 정착 이동을 첫 행동의 이동으로 세지 않는다
         self.goal_hit = False            # 정착 중 완주로 잡히지 않게
         self._update_cmd()               # 첫 nominal 명령
         self.cmd = self.cmd_nom.copy()
@@ -546,6 +683,7 @@ class RoverEnv(gym.Env):
         """
         a = np.clip(np.asarray(a, np.float64), -1, 1)
         c = self.cfg
+        self.route_dist_prev = self.path.distance(self.d.qpos[:2])
 
         # 1) **차체 수준 잔차**를 nominal 명령에 더한다.
         #    cmd_nom 은 pure pursuit 이 낸 것이고 보상·판정의 기준이다.
@@ -567,7 +705,7 @@ class RoverEnv(gym.Env):
         th_ik, v_ref = self._ik_of(cmd_app)
         du = np.clip(v_ref / self.v_max, -1.0, 1.0)       # 개루프 duty (Stage 1)
         self.n_wheel_desat += float(np.any(np.abs(v_ref) > self.v_max * 1.001))
-        th = np.clip(th_ik, -c.steer_lim, c.steer_lim)
+        th = np.clip(th_ik, self.st_lo_mj, self.st_hi_mj)
 
         # 3) 구동 노이즈.  통신 지연은 **차체 명령**에 걸어야 맞지만 Stage 1 은 OFF.
         self.act_buf.append((th.copy(), du.copy()))
@@ -628,10 +766,10 @@ class RoverEnv(gym.Env):
         r, term, info = self._reward(a, du_a, vs)
 
         # 4) 다음 nominal 명령과 관측
-        self._update_cmd()
-        self.hist.pop(0); self.hist.append(self._frame())
         self.a_prev2 = self.a_prev
         self.a_prev = a
+        self._update_cmd()
+        self.hist.pop(0); self.hist.append(self._frame())
         trunc = self.k >= self.episode_steps
         return self._obs(), r, term, trunc, info
 
@@ -674,27 +812,46 @@ class RoverEnv(gym.Env):
         den = max(self.v_cruise * dt_ctrl, 1e-6)
 
         # --- 경로추종: 논문의 진행·정렬·횡오차·방향·매끄러움 항 ------------
+        # task="cmdvel" 에서는 **이 블록 전체를 건너뛴다**.  지우지 않고 남기는
+        # 이유: 경로추종으로 되돌아올 수 있고, s13/s19 등 기존 체크포인트의
+        # 보상 공식을 재현해야 할 수 있다.
         # prog: 경로 호길이 진행.  실제 변위로 상한돼 정지 상태에서 0 이다.
         #       음수는 자른다.
         prog = float(np.clip((self.s_path - self.s_prev) / den, 0.0, 1.0))
-        # 스워브에서는 차체 기수 대신 실제 이동 방향과 경로 접선을 비교한다.
-        # 제자리에서는 이동 방향이 정의되지 않으므로 오차를 0으로 둔다.
+        # 실제 이동 방향오차는 진단/옛 보상 비교용이다. 현재 보상은
+        # 논문처럼 차체 기수오차를 정렬 게이트에 쓰며 이동 방향을 벌주지 않는다.
         delta_xy = self.d.qpos[:2] - self.last_xy
         travel = float(np.linalg.norm(delta_xy))
         # 2 cm/s 이하에서는 수치적 위치 떨림의 방향이 실제 진행 방향을
         # 대표하지 않으므로 각도 평가를 건너뛴다.
         if travel > 0.02 * dt_ctrl:
+            # 여기만 접선(heading_at)을 쓴다.  "한 제어주기 변위(~4mm)가 경로
+            # 방향과 맞나" 를 묻는 국소 질문이라 26cm 현으로 채점하면 안 된다.
+            # 진단 전용이다 (w_course = 0).
             path_heading = pth.heading_at(self.path, 0.5 * (self.s_prev + self.s_path))
             course_error = _wrap(float(np.arctan2(delta_xy[1], delta_xy[0]))
                                  - path_heading)
         else:
             course_error = 0.0
         movement = float(np.clip(travel / den, 0.0, 1.0))
+        route_dist_now = self.path.distance(self.d.qpos[:2])
         gate, terms = tracking_terms(
             prog, self.e_y, self.e_psi, a, self.a_prev, self.a_prev2, R,
-            course_error=course_error, movement=movement)
+            course_error=course_error, movement=movement,
+            lateral_recovery=recovery_potential(
+                self.route_dist_prev, route_dist_now, den, self.discount_gamma))
         align = prog * gate
         goal_bonus = R.r_goal if self.goal_hit else 0.0
+
+        if self.task == "cmdvel":
+            # 경로 항을 **전부 버리고** 속도추종으로 교체한다.
+            #   보상 = -(w_v*||v_xy 오차|| + w_om*|omega 오차|) / 정규화  - 행동벌점
+            # 경로·lookahead·align/prog/gate 가 보상에서 사라지므로, pure
+            # pursuit 튜닝(lookahead)과 경로 생성기 기하(꺾임각 분포)가 더 이상
+            # 결과를 교란하지 않는다.
+            terms = self._cmdvel_terms(a)
+            prog = align = gate = 0.0
+            goal_bonus = 0.0
 
         # --- 진단만 (가중치 0.  Stage 2 에서 켠다) --------------------------
         w_ang = np.array([self.d.qvel[j] for j in self.j_wh])
@@ -724,7 +881,10 @@ class RoverEnv(gym.Env):
         rew = float(sum(terms.values()))
 
         # 종료 조건
-        roll = self.hist[-1][15] * (np.pi / 2); pitch = self.hist[-1][16] * (np.pi / 2)
+        # hist[-1] 은 행동 전 관측이라 한 제어주기 늦다. 물리 직후 센서 참값을 쓴다.
+        w, x, y, z = self.d.sensordata[self.sadr["s_quat"]:self.sadr["s_quat"] + 4]
+        roll = float(np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y)))
+        pitch = float(np.arcsin(np.clip(2 * (w * y - z * x), -1, 1)))
         tip = abs(roll) > np.radians(60) or abs(pitch) > np.radians(60)
         # 누적 경로길이. 출발점으로부터의 거리로 재면 목표를 찍고 되돌아올 때
         # 값이 줄어들어 "정상 주행 중인데 고착" 으로 오판한다.
@@ -740,6 +900,13 @@ class RoverEnv(gym.Env):
                   else (terr.ARENA_X / 2, terr.ARENA_Y / 2))
         oob = bool(abs(self.d.qpos[0]) > hx - 0.1 or abs(self.d.qpos[1]) > hy - 0.1
                    or self.d.qpos[2] < -0.5)
+        # 종료/시간만료의 다음 상태 잠재값은 0. 이 보정이 없으면 목표 도착 시점에
+        # 남은 경로 실거리에 따라 shaping 총점이 달라지고 조기 종료를 악용할 수 있다.
+        if self.task == "path" and (tip or stuck or oob or self.goal_hit
+                                    or self.k >= self.episode_steps):
+            correction = R.w_recover * self.discount_gamma * route_dist_now / den
+            terms["recover"] += correction
+            rew += correction
         if stuck:
             # 귀속 순서가 곧 우선순위다. 배가 하중을 받아 바퀴가 뜬 상태가
             # 가장 치명적이고(토크 조절로 해결 불가), 그다음이 바퀴 스톨,
@@ -759,6 +926,9 @@ class RoverEnv(gym.Env):
             self.rsum[kk] = self.rsum.get(kk, 0.0) + vv
         A = self.acc
         A["slip"].append(slip); A["sink"].append(sink); A["e_y"].append(abs(self.e_y))
+        if self.vel_err_hist:
+            ve, oe = self.vel_err_hist[-1]
+            A["v_err"].append(ve); A["om_err"].append(oe)
         A["yaw"].append(max(0.0, float(np.cos(self.e_psi))))
         A["pw"].append(self.p_elec); A["prog"].append(prog)
         A["e_psi"].append(abs(np.degrees(self.e_psi)))
@@ -766,13 +936,17 @@ class RoverEnv(gym.Env):
             A["course"].append(abs(np.degrees(course_error)))
         # 경로를 완주하면 거기서 끝난다 -- 다음 목표를 이어붙이면 "경로를
         # 따라갔나" 라는 판정이 흐려진다.
-        term = bool(tip or stuck or oob or self.goal_hit)
+        # cmdvel 에서는 경로 완주가 과제가 아니므로 goal_hit 으로 끝내지 않는다
+        # (랜덤 twist 로 돌다가 우연히 목표 근처를 지나면 에피소드가 잘린다).
+        goal_term = self.goal_hit and self.task == "path"
+        term = bool(tip or stuck or oob or goal_term)
         # 성공 = **지정된 경로를 끝까지 따라갔나**.  예전 기준(간 거리 / 명령속도로
         # 갈 수 있었던 거리 >= 0.35)은 두 군데가 틀렸다:
         #   - 0.35 는 너무 관대했다 (3분의 1만 가도 성공)
         #   - path_len 이 누적 경로길이라 **헤매는 것에 보상**이 됐다
         # 경로 호길이 진행률은 둘 다 없다.  헤매면 s_path 가 안 늘어난다.
-        frac = float(self.s_path / max(self.path.total, 1e-6))
+        frac = float(np.clip((self.s_path - self.s0) /
+                             max(self.path.total - self.s0, 1e-6), 0.0, 1.0))
         # 완주 판정은 goal_hit 을 그대로 쓴다.  frac >= 0.9 로 재면 goal_hit 이
         # "남은 거리 0.25m" 에서 뜨므로 frac = 1 - 0.25/total 이 되어 **경로 길이가
         # 성공을 결정**한다 (2.15m 경로 -> 0.885 실패, 3.13m -> 0.920 성공).
@@ -809,7 +983,8 @@ class RoverEnv(gym.Env):
                     # 기어 손실, 드라이버 손실, 조향 서보, 전장 소비가 빠져 있어
                     # 배터리 지속시간 예측에는 못 쓴다 (모델 내부 비교용).
                     e_J=float(self.e_sum),
-                    e_per_m=float(self.e_sum / self.s_path) if self.s_path > 0.3 else float("nan"),
+                    e_per_m=(float(self.e_sum / (self.s_path - self.s0))
+                             if self.s_path - self.s0 > 0.3 else float("nan")),
                     goal_dist=float(self.goal_dist),
                     **{f"rterm_{kk}": vv for kk, vv in self.rsum.items()},
                     completed=completed, success=completed,

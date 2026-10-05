@@ -95,30 +95,56 @@ void swerve_fold_to_limit(float limit_rad, float unwind_rad, float slow_mps,
                           swerve_module_state_t state[SWERVE_NUM_MODULES],
                           swerve_module_cmd_t out[SWERVE_NUM_MODULES])
 {
+    float lo[SWERVE_NUM_MODULES];
+    float hi[SWERVE_NUM_MODULES];
     int i;
     if (limit_rad < SWERVE_HALF_PI) {
         limit_rad = SWERVE_HALF_PI; /* 이보다 좁으면 표현 불가능한 방향이 생긴다 */
     }
     for (i = 0; i < SWERVE_NUM_MODULES; i++) {
+        lo[i] = -limit_rad;
+        hi[i] = limit_rad;
+    }
+    swerve_fold_to_range(lo, hi, unwind_rad, slow_mps, state, out);
+}
+
+void swerve_fold_to_range(const float lo_rad[SWERVE_NUM_MODULES],
+                          const float hi_rad[SWERVE_NUM_MODULES],
+                          float unwind_rad, float slow_mps,
+                          swerve_module_state_t state[SWERVE_NUM_MODULES],
+                          swerve_module_cmd_t out[SWERVE_NUM_MODULES])
+{
+    int i;
+    for (i = 0; i < SWERVE_NUM_MODULES; i++) {
+        float lo = lo_rad[i];
+        float hi = hi_rad[i];
+        float center = 0.5f * (lo + hi);
         float th = out[i].angle_rad;
         float ref = state[i].initialized ? state[i].last_cmd_rad : 0.0f;
         /* 직전 명령각에 가장 가까운 등가각 th + n*PI */
         float n = floorf((ref - th) / SWERVE_PI + 0.5f);
         float folded = th + n * SWERVE_PI;
-        /* 가동범위를 벗어나면 한 칸 되돌린다 (limit >= PI/2 면 반드시 안에 든다) */
-        if (folded > limit_rad) {
+        /* 가동범위를 벗어나면 한 칸 되돌린다 (폭 >= PI 면 반드시 안에 든다) */
+        if (folded > hi) {
             n -= 1.0f;
-        } else if (folded < -limit_rad) {
+        } else if (folded < lo) {
             n += 1.0f;
         }
         folded = th + n * SWERVE_PI;
-        /* 이음매에서 멀어지도록 미리 푼다: 각이 크고 이 바퀴가 구동 중이 아니면
-         * 0 에 가까운 등가각으로 넘어간다 (그때는 180도 회전이 공짜다). */
-        if (unwind_rad > 0.0f && fabsf(folded) > unwind_rad
+        /* 폭 < PI 면 어떤 등가각도 범위 밖인 방향이 있다. 기구 보호가 우선이라
+         * 경계에 붙인다 (그 바퀴의 방향은 틀어진다). */
+        if (folded > hi) {
+            folded = hi;
+        } else if (folded < lo) {
+            folded = lo;
+        }
+        /* 이음매에서 멀어지도록 미리 푼다: 범위 중앙에서 멀고 이 바퀴가 구동
+         * 중이 아니면 중앙에 가까운 등가각으로 넘어간다 (그때는 180도 회전이 공짜다). */
+        if (unwind_rad > 0.0f && fabsf(folded - center) > unwind_rad
             && fabsf(out[i].speed_mps) < slow_mps) {
-            float alt = folded - (folded > 0.0f ? SWERVE_PI : -SWERVE_PI);
-            if (fabsf(alt) < fabsf(folded) && fabsf(alt) <= limit_rad) {
-                n += (folded > 0.0f ? -1.0f : 1.0f);
+            float alt = folded - (folded > center ? SWERVE_PI : -SWERVE_PI);
+            if (fabsf(alt - center) < fabsf(folded - center) && alt >= lo && alt <= hi) {
+                n += (folded > center ? -1.0f : 1.0f);
                 folded = alt;
             }
         }

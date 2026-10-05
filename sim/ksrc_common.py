@@ -67,6 +67,27 @@ def swerve_fold_to_limit(limit_rad, state, out, unwind_rad=0.0, slow_mps=0.0):
     return out
 
 
+_lib.swerve_fold_to_range.argtypes = [
+    ctypes.c_float * SWERVE_NUM_MODULES, ctypes.c_float * SWERVE_NUM_MODULES,
+    ctypes.c_float, ctypes.c_float,
+    SwerveModuleState * SWERVE_NUM_MODULES,
+    SwerveModuleCmd * SWERVE_NUM_MODULES,
+]
+_lib.swerve_fold_to_range.restype = None
+
+
+def swerve_fold_to_range(lo_rad, hi_rad, state, out, unwind_rad=0.0, slow_mps=0.0):
+    """바퀴별 가동범위 [lo[i], hi[i]] 안으로 접는다 (C 모듈 순서). out 을 제자리 수정.
+
+    펌웨어 main.c Swerve_Control 이 joint.c 범위로 부르는 것과 **같은 C 함수**.
+    """
+    lo = (ctypes.c_float * SWERVE_NUM_MODULES)(*lo_rad)
+    hi = (ctypes.c_float * SWERVE_NUM_MODULES)(*hi_rad)
+    _lib.swerve_fold_to_range(lo, hi, ctypes.c_float(unwind_rad), ctypes.c_float(slow_mps),
+                              state, out)
+    return out
+
+
 def swerve_ik_compute(vx, vy, omega, modules, max_wheel_mps, state):
     """modules, state 는 SwerveModulePos*4 / SwerveModuleState*4 ctypes 배열.
     state 는 제자리에서 수정된다(C API 와 동일). SwerveModuleCmd*4 를 돌려준다."""

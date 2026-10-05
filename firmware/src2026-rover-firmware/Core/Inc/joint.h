@@ -42,6 +42,20 @@ typedef struct {
     float    max_deg;   /**< 허용 최대 각도 (도) */
 } JointConfig_t;
 
+/**
+ * @brief  서보 한 개의 실측값 (레지스터 56~65 를 한 번에 읽은 것)
+ *
+ * 각도·속도·부하는 offset/dir 을 적용한 **관절 기준** 값이다 (T 명령과 같은 부호).
+ */
+typedef struct {
+    float    angle_deg;   /**< 현재 각도 (도) */
+    int16_t  speed;       /**< 현재 속도 step/s (4096 step = 360도) */
+    int16_t  load;        /**< 부하 0.1% 단위, -1000..1000 */
+    uint8_t  voltage;     /**< 전압 0.1V 단위 */
+    uint8_t  temp;        /**< 온도 섭씨 */
+    uint8_t  status;      /**< 상태 비트 (레지스터 65) */
+} JointFeedback_t;
+
 /* ========================== 함수 프로토타입 ========================== */
 
 /**
@@ -60,8 +74,30 @@ void joint_init(void);
  *
  * @param  theta  목표 각도 배열 (도 단위, 예: {10.5, -20.0})
  * @param  count  배열 크기 (SERVO_COUNT와 일치해야 함)
+ * @return 가동범위 경계로 잘린 각도 개수 (0 = 전부 범위 안)
  */
-void on_target_angles_received(float *theta, int count);
+int on_target_angles_received(float *theta, int count);
+
+/**
+ * @brief  관절 가동범위 (도). 기구학이 조향각을 이 범위 안으로 접을 때 쓴다.
+ * @param  idx  관절 인덱스 (0 ~ SERVO_COUNT-1)
+ */
+void joint_get_limits_deg(int idx, float *min_deg, float *max_deg);
+
+/**
+ * @brief  현재 각도 읽기 (실패해도 출력하지 않음 -- 제어주기용)
+ * @return 1 = 성공, 0 = 읽기 실패
+ */
+int joint_read_angle(int idx, float *deg);
+
+/**
+ * @brief  위치·속도·부하·전압·온도·상태를 한 번의 READ 로 읽기 (10바이트)
+ *
+ * 위치만 읽는 것과 비교해 서보당 약 80us 더 걸린다 (1Mbps).  한 번 읽기의
+ * 대부분은 서보 반환 지연(기본 500us)이다.
+ * @return 1 = 성공, 0 = 실패 (출력 없음)
+ */
+int joint_read_feedback(int idx, JointFeedback_t *fb);
 
 /**
  * @brief  특정 관절의 현재 각도 읽기

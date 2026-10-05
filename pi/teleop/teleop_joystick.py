@@ -37,7 +37,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # pi/ -> import common.*
 from common.nucleo_link import encode_velocity_cmd
-from joystick_math import clamp_to_unit_circle, left_pad_to_linear, right_pad_to_angular
+from joystick_math import (apply_deadzone, clamp_to_unit_circle, left_pad_to_linear,
+                           lock_low_speed_direction, right_pad_to_angular, snap_to_axes)
 
 WIDTH, HEIGHT = 640, 380
 PAD_RADIUS = 100
@@ -80,7 +81,8 @@ class Pad:
 def make_frame_encoder(fmt):
     """Returns encode(vx, vy, omega) -> bytes for the chosen wire format."""
     if fmt == "ascii":
-        return lambda vx, vy, omega: f"V {vx:.3f} {vy:.3f} {omega:.3f}\n".encode("ascii")
+        # + 0.0 : 패드 중앙의 -0.0 이 "V -0.000" 으로 찍혀 헷갈리지 않게
+        return lambda vx, vy, omega: f"V {vx + 0.0:.3f} {vy + 0.0:.3f} {omega + 0.0:.3f}\n".encode("ascii")
     return encode_velocity_cmd
 
 
@@ -91,13 +93,22 @@ class RosSink:
         import rclpy
         from geometry_msgs.msg import Twist
 
-        rclpy.init()
+        # Ctrl+C 를 rclpy 가 가로채면 컨텍스트가 먼저 닫혀서, 종료 시 보내는 정지
+        # 명령이 "publisher's context is invalid" 로 실패한다 (로버가 마지막 명령으로
+        # 계속 감). 신호 처리를 파이썬에 맡겨 finally 의 정지 명령이 나가게 한다.
+        try:
+            from rclpy.signals import SignalHandlerOptions
+            rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+        except (ImportError, TypeError):
+            rclpy.init()
         self.rclpy = rclpy
         self.Twist = Twist
         self.node = rclpy.create_node("ksrc_teleop_joystick")
         self.pub = self.node.create_publisher(Twist, topic, 10)
 
     def send(self, vx, vy, omega):
+        if not self.rclpy.ok():
+            return
         msg = self.Twist()
         msg.linear.x = float(vx)
         msg.linear.y = float(vy)
@@ -106,7 +117,8 @@ class RosSink:
 
     def close(self):
         self.node.destroy_node()
-        self.rclpy.shutdown()
+        if self.rclpy.ok():
+            self.rclpy.shutdown()
 
 
 def run(args):
@@ -125,6 +137,14 @@ def run(args):
         ser = serial.Serial(args.port, args.baud, timeout=0)
         send = lambda vx, vy, omega: ser.write(encode(vx, vy, omega))
 
+    # --monitor: STM 이 받은 값을 되돌려 찍게 하고(CTRL ON), 보낸 값과 나란히 출력한다.
+    monitor = getattr(args, "monitor", False) and not ros_mode
+    rx_buf = b""
+    next_mon = time.monotonic()
+    if monitor:
+        ser.write(b"CTRL ON\n")
+        print("[monitor] PC > 는 보낸 값, STM> 는 펌웨어가 받은 값 (텔레옵 시작 후 5Hz)")
+
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("KSRC swerve teleop (joystick)")
@@ -136,6 +156,7 @@ def run(args):
 
     period = 1.0 / args.rate
     next_send = time.monotonic()
+    last_dir = None   # 직전에 내보낸 병진 방향 (저속 방향 고정용)
     running = True
 
     try:
@@ -167,9 +188,16 @@ def run(args):
                 left_pad.release()
                 right_pad.release()
 
-            vx, vy = left_pad_to_linear(left_pad.nx, left_pad.ny, args.max_lin)
+            dz = getattr(args, "deadzone", 0.0)
+            lnx, lny = apply_deadzone(left_pad.nx, left_pad.ny, dz)
+            lnx, lny = snap_to_axes(lnx, lny, getattr(args, "snap_deg", 0.0))
+            lnx, lny, last_dir = lock_low_speed_direction(
+                lnx, lny, last_dir, getattr(args, "hold_mag", 0.0),
+                getattr(args, "hold_deg", 180.0))
+            vx, vy = left_pad_to_linear(lnx, lny, args.max_lin)
             if right_pad.dragging:
-                omega = right_pad_to_angular(right_pad.nx, args.max_ang)
+                rnx, _ = apply_deadzone(right_pad.nx, 0.0, dz)
+                omega = right_pad_to_angular(rnx, args.max_ang)
             elif keys[pygame.K_q] and not keys[pygame.K_e]:
                 omega = args.max_ang
             elif keys[pygame.K_e] and not keys[pygame.K_q]:
@@ -183,6 +211,17 @@ def run(args):
             if now >= next_send:
                 send(vx, vy, omega)
                 next_send = now + period
+
+            if monitor:
+                rx_buf += ser.read(4096)
+                while b"\n" in rx_buf:
+                    line, rx_buf = rx_buf.split(b"\n", 1)
+                    text = line.decode("utf-8", "replace").strip()
+                    if text:
+                        print(f"STM> {text}")
+                if now >= next_mon:
+                    print(f"PC > v {vx + 0.0:+.3f} {vy + 0.0:+.3f} {omega + 0.0:+.3f}")
+                    next_mon = now + 0.2
 
             screen.fill((24, 24, 28))
             for pad, label in ((left_pad, "translate"), (right_pad, "rotate")):
@@ -227,8 +266,24 @@ def main():
     ap.add_argument("--topic", default="/cmd_vel", help="--ros 발행 토픽")
     ap.add_argument("--max-lin", type=float, default=0.5, help="pad-full-deflection |vx|,|vy| in m/s")
     ap.add_argument("--max-ang", type=float, default=2.0, help="pad-full-deflection |omega| in rad/s")
+    ap.add_argument("--deadzone", type=float, default=0.1,
+                    help="패드 중심 데드존 (반경 비율). 중심 근처 손떨림이 바퀴 방향을 "
+                         "홱홱 돌리지 않게 한다. 0 이면 끔")
+    ap.add_argument("--monitor", action="store_true",
+                    help="(직렬 모드) STM 에 CTRL ON 을 보내고, 보낸 vx vy w 와 STM 이 받은 값을 "
+                         "터미널에 나란히 출력")
+    ap.add_argument("--snap-deg", type=float, default=10.0,
+                    help="앞·뒤·좌·우 축에서 이 각도 이내면 축으로 맞춤 (횡걸음 잔떨림 제거). 0 이면 끔")
+    ap.add_argument("--hold-mag", type=float, default=0.35,
+                    help="이 크기(반경 비율) 미만에서는 바퀴 축을 크게 바꾸는 방향을 0 으로 "
+                         "(우->좌 전환 중 중앙을 스쳐도 조향이 돌지 않음). 0 이면 끔")
+    ap.add_argument("--hold-deg", type=float, default=20.0,
+                    help="--hold-mag 미만에서 허용하는 바퀴 축 변화 (도). 정반대 방향은 항상 허용")
     args = ap.parse_args()
-    run(args)
+    try:
+        run(args)
+    except KeyboardInterrupt:
+        pass   # 정지 명령은 run() 의 finally 가 이미 보냈다
 
 
 if __name__ == "__main__":

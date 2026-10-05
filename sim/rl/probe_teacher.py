@@ -32,7 +32,6 @@ import torch
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from env import RoverEnv, PRIV_DIM
-from reward import PRESETS as REWARD_PRESETS
 from nets import PROPRIO_DIM
 
 SOIL = ["mu_max", "K", "alpha", "beta", "c_r", "k_z", "z_max", "mu_lat"]
@@ -47,7 +46,7 @@ def rollout(tp, enc, rms, n, arena, difficulty, mode, rng, episode_s=20.0,
     """mode: 'normal' | 'zero' | 'swap'(다른 에피소드의 같은 시각 z)"""
     out = []; zs = []; soils = []; traj = []
     for i in range(n):
-        e = RoverEnv(rew=REWARD_PRESETS["balanced"], difficulty=difficulty,
+        e = RoverEnv(difficulty=difficulty,
                      episode_s=episode_s, arena_eval=arena, eval_kind="sand",
                      privileged=True, seed=seed0 + i)
         o, _ = e.reset(seed=seed0 + i)

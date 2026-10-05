@@ -4,8 +4,8 @@
 그래서 "Nav2 가 우리 로버에 맞게 도는가" 만 남고 측위 문제가 섞이지 않는다.
 실제 측위(D435 지형 ICP)가 되면 그 항등 변환만 갈아끼우면 된다.
 
-인지가 없으므로 costmap 은 static + inflation 뿐이다.  통과 불가 영역은 이미
-정적 맵에 들어 있다 (terrain.export_costmap 이 경사 21도 상한으로 구운 것).
+인지가 없으므로 costmap 은 static + inflation 뿐이다. 정적 맵은 경사·단차의
+통행 불가 영역을 표시하고, 실제 로버 크기는 0.19m 풋프린트로 반영한다.
 
 사용 (브리지 + Nav2 + RViz 를 함께 실행):
   ros2 launch nav2_ksrc.launch.py                       # 규사
@@ -44,6 +44,8 @@ def setup(ctx, *args, **kw):
     rl_model = LaunchConfiguration("rl_model").perform(ctx)
     rl_vecnorm = LaunchConfiguration("rl_vecnorm").perform(ctx)
     rl_scale = LaunchConfiguration("rl_scale").perform(ctx)
+    mech_fold = LaunchConfiguration("mech_fold").perform(ctx).lower() in ("1", "true", "yes")
+    steer_limit = LaunchConfiguration("steer_limit_deg").perform(ctx)
     domain_id = LaunchConfiguration("domain_id").perform(ctx)
     if terrain not in ("sand", "rock"):
         raise RuntimeError(f"알 수 없는 지형: {terrain}. sand 또는 rock 을 사용하세요.")
@@ -93,6 +95,17 @@ def setup(ctx, *args, **kw):
                       "--drive-align-gate-deg", drive_align_gate_deg]
         if mode == "teleop" and use_teleop_guard:
             bridge_cmd.append("--teleop-guard")
+        if mech_fold:
+            bridge_cmd.append("--mech-fold")
+        if steer_limit:
+            try:
+                lim = float(steer_limit)
+            except ValueError as exc:
+                raise RuntimeError("steer_limit_deg 는 숫자여야 합니다") from exc
+            if not (90.0 <= lim <= 180.0):
+                raise RuntimeError("steer_limit_deg 는 90~180 사이여야 합니다 "
+                                   "(90 미만이면 낼 수 없는 방향이 생깁니다)")
+            bridge_cmd += ["--steer-limit-deg", steer_limit]
         if use_rl:
             if not os.path.isfile(rl_model) or not os.path.isfile(rl_vecnorm):
                 raise RuntimeError(f"RL 모델 또는 vecnorm 이 없음: {rl_model}, {rl_vecnorm}")
@@ -162,12 +175,26 @@ def generate_launch_description():
                               description="전 모드 공통 구동 허용 조향 오차 [deg], 0=끔"),
         DeclareLaunchArgument("rl", default_value="false",
                               description="브리지에서 3D student RL 잔차를 적용"),
+        # 2026-10-04: s2 -> s13 @2.0M.  s2 는 조향 +-180도, 옛 보상, 옛 e_psi 기준에서
+        # 학습해 현 환경과 맞지 않았다.  s13 @2.0M 은 holdout 100 에피소드 짝비교에서
+        # 순수 IK 를 **유의하게 이긴 유일한 체크포인트**다 (잡음 ON 조건):
+        #   횡오차 21.68 -> 19.80mm (-8.7%),  p90 46.58 -> 42.34mm (-9.1%)
+        #   기수 7.38 -> 7.12도 (-3.5%),      완주율 95% 유지
+        # 다른 시드(seed0=2000)·다른 경로세트(path-seed=7777)에서도 -10.0% / -8.6% 로
+        # 재현된다.  대가: 슬립 +26%, 소요시간 +3.8%, cmd_sat 4.6배.
+        # **잡음 OFF 조건에서는 중립적**이다 (평균 횡오차 +4.9% 비유의, p90 -7.6% 유의).
         DeclareLaunchArgument("rl_model", default_value=os.path.join(
-            HERE, "..", "sim", "rl", "runs", "s2", "final.zip")),
+            HERE, "..", "sim", "rl", "runs", "s13_resid",
+            "ppo_1999900_steps.zip")),
         DeclareLaunchArgument("rl_vecnorm", default_value=os.path.join(
-            HERE, "..", "sim", "rl", "runs", "s2", "vecnorm.pkl")),
+            HERE, "..", "sim", "rl", "runs", "s13_resid",
+            "ppo_vecnormalize_1999900_steps.pkl")),
         DeclareLaunchArgument("rl_scale", default_value="1.0",
                               description="정책 잔차 배율 [0,1]"),
+        DeclareLaunchArgument("mech_fold", default_value="false",
+                              description="접기를 '모터가 차체 중심에 가까운 쪽' 으로"),
+        DeclareLaunchArgument("steer_limit_deg", default_value="",
+                              description="조향 가동범위 ±[deg], 빈 값이면 config 기본(±100)"),
         DeclareLaunchArgument("domain_id", default_value="77"),
         OpaqueFunction(function=setup),
     ])

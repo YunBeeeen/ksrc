@@ -44,8 +44,9 @@ import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "sim" / "rl"))
 import mujoco                                    # noqa: E402
 import env as ksrc_env                           # noqa: E402
+import path as pth                                # noqa: E402
 from config import RoverCfg                      # noqa: E402
-from reward import PRESETS as REWARD_PRESETS     # noqa: E402
+from reward import RewardCfg                     # noqa: E402
 from policy_observation import PolicyPath, set_route_fields  # noqa: E402
 from teleop_transition import TeleopTransitionGuard  # noqa: E402
 
@@ -79,8 +80,20 @@ class Bridge(Node):
         # 경로 추종은 Nav2 가 하므로 env 의 내부 pure pursuit 은 쓰지 않는다.
         # paths=None 이면 env 가 자체 경로를 만들지만, cmd 를 외부에서 덮어쓴다.
         # 규사 대회맵의 평탄 구역에서만 시작한다. 학습/평가 스폰 분포는 그대로.
-        self.env = ksrc_env.RoverEnv(
-            rew=REWARD_PRESETS["balanced"], difficulty=args.d,
+        # --mech-fold: 접기 기준을 '모터가 차체 중심에 가까운 쪽' 으로 바꾼다.
+        # 차체 운동은 동일하고 모터가 어디로 튀어나오는지만 달라진다.
+        # 측정으로는 손해(서보회전 +14.7%, 반전 +46%)지만 눈으로 비교할 수 있게 둔다.
+        env_cls = ksrc_env.RoverEnv
+        if args.mech_fold:
+            from mech_fold import MechFoldEnv
+            env_cls = MechFoldEnv
+        cfg = None
+        if args.steer_limit_deg is not None:
+            lim = float(args.steer_limit_deg)
+            cfg = RoverCfg(steer_lo_deg=(-lim,) * 4, steer_hi_deg=(lim,) * 4)
+        self.env = env_cls(
+            cfg=cfg,
+            rew=RewardCfg(), difficulty=args.d,
             arena_eval=True, eval_kind=args.terrain,
             randomize=False, perturb=0.0, seed=args.seed,
             episode_s=1e6,
@@ -212,9 +225,13 @@ class Bridge(Node):
         action = np.zeros(3, dtype=np.float32)
         if self.policy_path is not None:
             pos = self.env.d.qpos[:2]
-            wp_b, e_y, e_psi = self.policy_path.features(pos, self.env._yaw())
+            target_L = pth.pursuit_distance(
+                float(np.linalg.norm(self.cmd_filtered[:2])),
+                self.cfg.pp_k_v, self.cfg.pp_l_min, self.cfg.pp_l_max)
+            route_features = self.policy_path.features(
+                pos, self.env._yaw(), target_L)
             set_route_fields(self.env.hist, self.cmd_filtered, self.env.v_max,
-                             (wp_b, e_y, e_psi), all_frames=self.new_plan)
+                             route_features, all_frames=self.new_plan)
             self.new_plan = False
             self.obs = self.env._obs()
             # 학습 과제는 경로를 따라 이동하는 동안의 보정이다. Nav2 가 목표에서
@@ -305,6 +322,12 @@ def main():
     ap.add_argument("--vecnorm", default=None, help="모델과 짝인 VecNormalize pickle")
     ap.add_argument("--rl-scale", type=float, default=1.0,
                     help="정책 잔차 배율 [0,1]")
+    ap.add_argument("--mech-fold", action="store_true",
+                    help="접기 선택을 '모터가 차체 중심에 가까운 쪽' 으로 바꾼다 "
+                         "(횡걸음에서 FL-90 FR+90 RL+90 RR-90). 운동은 동일")
+    ap.add_argument("--steer-limit-deg", type=float, default=None,
+                    help="조향 가동범위 ±[deg] 덮어쓰기 (기본 config 의 ±100). "
+                         "±110 이상은 모터가 타이어보다 바깥으로 나간다")
     ap.add_argument("--view", action="store_true", help="MuJoCo 뷰어도 띄운다")
     args, _ = ap.parse_known_args()
     if not math.isfinite(args.cmd_filter_tau) or args.cmd_filter_tau < 0:

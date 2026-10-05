@@ -36,3 +36,137 @@ def encode_velocity_cmd(vx: float, vy: float, omega: float) -> bytes:
     payload = struct.pack("<fff", vx, vy, omega)
     body = bytes([MSG_VELOCITY_CMD, len(payload)]) + payload
     return bytes([SYNC0, SYNC1]) + body + bytes([crc8(body)])
+
+
+# ---------------------------------------------------------------------------
+# SPI 링크 (Pi = SPI 마스터, Nucleo SPI2 = 슬레이브)
+#
+# firmware/common/spi_link.h/.c 와 **바이트 단위로 동일**하다. 레이아웃 설명은
+# spi_link.h 가 정본이다. 전이중이라 한 번의 전송(144 바이트)에서 명령을 보내며
+# 동시에 Nucleo 가 직전 제어주기(50Hz)에 만든 텔레메트리를 받는다.
+# 텔레메트리 하나에 구동 엔코더, 조향 서보 실측(STS3215), IMU(ISM330DHCX) 가
+# 같은 제어주기 시각 t_ms 로 묶여 있다.
+#
+# Pi 설정: SPI 모드 0, 8비트, 1MHz 권장 (Nucleo 가 HSI 16MHz 라 8MHz 가 절대 상한).
+# 반드시 매번 SPI_FRAME_LEN 바이트를 한 번의 CS 구간으로 보낸다. 길이가 다르면
+# Nucleo 가 그 전송을 버린다.
+# ---------------------------------------------------------------------------
+
+SPI_FRAME_LEN = 144
+SPI_SYNC0 = 0xA5
+SPI_SYNC1 = 0x5A
+SPI_VERSION = 2
+SPI_TYPE_POLL = 0x00
+SPI_TYPE_VEL_CMD = 0x01
+SPI_TYPE_TELEMETRY = 0x81
+
+TLM_FLAG_TELEOP_ACTIVE = 1 << 0
+TLM_FLAG_WATCHDOG = 1 << 1
+TLM_FLAG_GATE_PENDING = 1 << 2
+TLM_FLAG_SRC_SPI = 1 << 3
+TLM_FLAG_IMU_VALID = 1 << 4
+TLM_FLAG_SERVO_READ_ERR = 1 << 5
+TLM_FLAG_STEER_CLAMPED = 1 << 6
+TLM_FLAG_GATE_TIMEOUT = 1 << 7    # 정렬 대기 1.5초 초과로 강제 해제 (조향 막힘 의심)
+
+# [2]..[141] 영역: ver, type, seq_echo, tick, flags, t_ms, cmd x3, ticks x4,
+# wheel_mps x4, steer_cmd x4, duty x4, imu x6, rx_err,
+# steer_meas x4, steer_speed x4, steer_load x4, volt x4, temp x4, status x4, servo_valid, 예약 3
+_TLM_BODY = struct.Struct("<BBBBHI3f4i4f4f4h6hH4f4h4h4B4B4BB3x")
+assert 2 + _TLM_BODY.size == SPI_FRAME_LEN - 2
+
+# 원시값 -> 물리량 (펌웨어 imu_ism330.c 설정: ±500 dps, ±4 g)
+IMU_GYRO_DPS_PER_LSB = 0.0175
+IMU_ACC_G_PER_LSB = 0.000122
+STEER_STEP_PER_REV = 4096
+
+
+def crc16(data: bytes) -> int:
+    """CRC-16/CCITT-FALSE. spi_link.c 의 spi_link_crc16() 과 비트 단위로 동일."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def encode_spi_cmd(vx: float, vy: float, omega: float, seq: int,
+                   msg_type: int = SPI_TYPE_VEL_CMD) -> bytes:
+    """SPI 명령 프레임 (SPI_FRAME_LEN 바이트, 0 패딩). msg_type=SPI_TYPE_POLL 이면 명령 없이
+    텔레메트리만 읽는다 (Nucleo 워치독을 갱신하지 않는다)."""
+    body = struct.pack("<BBBBfff", SPI_VERSION, msg_type, seq & 0xFF, 0, vx, vy, omega)
+    head = bytes([SPI_SYNC0, SPI_SYNC1]) + body
+    frame = head + struct.pack("<H", crc16(body))
+    return frame + bytes(SPI_FRAME_LEN - len(frame))
+
+
+def decode_spi_telemetry(frame: bytes):
+    """텔레메트리 프레임 -> dict. 동기/버전/CRC/타입이 틀리면 None.
+
+    지연: 받는 값은 Nucleo 가 **직전 CS 해제 시점까지** 만든 프레임이라 0~40ms 묵었고,
+    방금 보낸 명령은 아직 반영되지 않았다 (seq_echo 로 확인). Pi 교환과 Nucleo 50Hz
+    제어주기가 비동기라 같은 tick 을 두 번 받거나 하나를 건너뛸 수 있다 -> tick 으로
+    중복을 거른다. 시각은 수신 시각이 아니라 t_ms (Nucleo 클럭) 를 쓴다.
+    배열은 모듈 순서 FL, FR, RL, RR. imu 값은 flags & TLM_FLAG_IMU_VALID,
+    서보 값은 servo_valid[m] 일 때만 믿는다."""
+    if len(frame) != SPI_FRAME_LEN or frame[0] != SPI_SYNC0 or frame[1] != SPI_SYNC1:
+        return None
+    body = bytes(frame[2:SPI_FRAME_LEN - 2])
+    if struct.unpack_from("<H", frame, SPI_FRAME_LEN - 2)[0] != crc16(body):
+        return None
+    v = _TLM_BODY.unpack(body)
+    if v[0] != SPI_VERSION or v[1] != SPI_TYPE_TELEMETRY:
+        return None
+    return {
+        "seq_echo": v[2],
+        "tick": v[3],
+        "flags": v[4],
+        "t_ms": v[5],
+        "cmd": v[6:9],
+        "enc_ticks": v[9:13],
+        "wheel_mps": v[13:17],
+        "steer_cmd_rad": v[17:21],
+        "duty": v[21:25],
+        "imu_raw": v[25:31],              # gyro xyz, acc xyz (센서 좌표계)
+        "gyro_dps": tuple(x * IMU_GYRO_DPS_PER_LSB for x in v[25:28]),
+        "acc_g": tuple(x * IMU_ACC_G_PER_LSB for x in v[28:31]),
+        "rx_err": v[31],
+        "steer_meas_rad": v[32:36],
+        "steer_speed": v[36:40],          # step/s (4096 step = 1회전)
+        "steer_load": v[40:44],           # 0.1 %
+        "steer_volt": tuple(x * 0.1 for x in v[44:48]),
+        "steer_temp": v[48:52],           # 섭씨
+        "steer_status": v[52:56],
+        "servo_valid": tuple(bool(v[56] >> m & 1) for m in range(4)),
+    }
+
+
+class SpiLink:
+    """spidev 로 Nucleo 와 한 번에 한 프레임씩 주고받는다.
+
+    link = SpiLink(bus=0, device=0)
+    tlm = link.exchange(0.1, 0.0, 0.0)   # 명령 보내고, 직전 텔레메트리 받기
+    """
+
+    def __init__(self, bus: int = 0, device: int = 0, speed_hz: int = 1_000_000):
+        import spidev  # Pi 에서만 필요하므로 여기서 import
+        self._spi = spidev.SpiDev()
+        self._spi.open(bus, device)
+        self._spi.mode = 0
+        self._spi.bits_per_word = 8
+        self._spi.max_speed_hz = speed_hz
+        self._seq = 0
+
+    def exchange(self, vx: float, vy: float, omega: float, poll_only: bool = False):
+        self._seq = (self._seq + 1) & 0xFF
+        frame = encode_spi_cmd(vx, vy, omega, self._seq,
+                               SPI_TYPE_POLL if poll_only else SPI_TYPE_VEL_CMD)
+        rx = bytes(self._spi.xfer2(list(frame)))
+        return decode_spi_telemetry(rx)
+
+    def close(self):
+        self._spi.close()

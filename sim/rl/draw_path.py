@@ -39,6 +39,7 @@ def main():
     Z = terr.load_arena(args.terrain)
     ex, ey = terr.eval_extent(args.terrain)
     drive, slope = terr.drivable_mask(Z, ex, ey, max_slope_deg=lim)
+    drive = terr.center_clearance_mask(drive, ex, ey, cfg.route_clearance)
 
     fig, ax = plt.subplots(figsize=(7.5, 9))
     ext = [-ex / 2, ex / 2, -ey / 2, ey / 2]

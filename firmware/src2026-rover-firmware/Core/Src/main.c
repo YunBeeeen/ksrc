@@ -31,6 +31,10 @@
 #include "joint.h"
 #include "swerve_kinematics.h"
 #include "mdd3a_driver.h"
+#include "drive_align_gate.h"
+#include "spi_link.h"
+#include "pi_spi.h"
+#include "imu_ism330.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -48,12 +52,25 @@ typedef struct {
 /* USER CODE BEGIN PD */
 /* Motor & Encoder Specifications */
 #define GEAR_RATIO          131.0f             /**< 131:1 Gearbox reduction (SPG30E-GR131) */
-/* 조향 가동범위 [rad].  서보(STS3215)는 다회전 가능하고 sts3215_protocol.c 가
- * 이음매를 처리하므로 **제약은 배선 꼬임뿐**이다 (슬립링 없음).
- * 실제 배선 여유를 재서 확정할 것. 최소 PI/2 여야 모든 방향을 표현할 수 있다. */
-#define SWERVE_STEER_LIMIT_RAD  3.14159265f   /* +-180deg */
+/* 조향 가동범위는 바퀴마다 다르다 (구동모터가 몸체 안쪽을 향하게 고정).
+ * joint.c 의 joint_config[].min_deg/max_deg 가 유일한 정본이고, Swerve_Control 이
+ * 매 주기 읽어서 swerve_fold_to_range 에 넘긴다. */
 
-#define ENCODER_PPR         16.0f              /**< 16 pulses per motor rev (Cytron wire-ID chart: "16 x GR = resolution") */
+/* 제어주기.  시뮬(sim/rl/env.py CTRL_HZ=50)과 같은 50Hz.
+ * 명령(UART V / SPI)은 목표값만 바꾸고, IK·정렬 게이트·서보·PWM·텔레메트리는
+ * 전부 이 주기에서만 나간다. */
+#define CTRL_PERIOD_MS          20U
+
+/* 구동 정렬 게이트 (sim/rl/env.py 의 drive_align_gate 와 같은 값).
+ * 목표 조향각이 한 주기에 60도 넘게 바뀌면, 네 바퀴 실제각이 목표의 10도 안에
+ * 들 때까지 구동을 보류한다.  0 으로 두면 게이트 OFF. */
+#define DRIVE_GATE_TRIGGER_DEG  60.0f
+#define DRIVE_GATE_RELEASE_DEG  10.0f
+/* 이 시간 넘게 정렬이 안 되면 (모래에서 정지 조향이 안 먹힘, 기구 간섭 등) 보류를
+ * 풀고 텔레메트리 GATE_TIMEOUT 을 세운다. 영원히 구동이 막히는 교착 방지. */
+#define DRIVE_GATE_MAX_HOLD_MS  1500U
+
+#define ENCODER_PPR         16.0f              /**< 16 pulses per motor rev. 2026-10-03 확인: MOT 1 799 2000 무부하 77.8 rpm (정격 76) */
 #define ENCODER_CPR         (ENCODER_PPR * 4.0f) /**< 64 ticks in 4x mode (TIM_ENCODERMODE_TI12) */
 #define TICKS_PER_REV       (ENCODER_CPR * GEAR_RATIO) /**< 8384.0 ticks per wheel rev */
 
@@ -71,7 +88,9 @@ typedef struct {
  * servo-ID mapping is also unconfirmed against actual wiring -- both
  * placeholders until bench-verified. Servo IDs use joint.c's array index
  * (0-based; joint_config[] maps index->bus ID internally). */
-/* 조립 STL 실측값 (sim/rl/config.py: axle_x=0.0918, track=0.2367 -> track/2=0.11835).
+/* 2026-10-03 실측: 중심 -> 앞/뒤 조향축 105mm, 좌/우 132.5mm (조향축 = 바퀴 중심).
+ * sim/rl/config.py 의 axle_x=0.105, track=0.265 (-> track/2=0.1325) 와 같아야 한다.
+ * 이전 STL 값 (±0.0918, ±0.11835).
  * 이전 (±0.12, ±0.12) 는 추정치였다.  순수 병진(vx, vy)에서는 모듈 위치가 결과에
  * 영향을 주지 않지만 omega != 0 이면 v_i = v_B + omega x r_i 로 오차가 남는다:
  *     제자리회전 w=0.8  -> 조향각 최대 7.20도
@@ -79,12 +98,46 @@ typedef struct {
  *     실주행 중앙값     -> 0.90도
  * 시뮬과 반드시 같은 값이어야 한다 (같은 C 코드를 공유하는 의미가 없어진다). */
 static const swerve_module_pos_t SWERVE_MODULES[SWERVE_NUM_MODULES] = {
-    { 0.0918f,  0.11835f },  /* module 0: FL */
-    { 0.0918f, -0.11835f },  /* module 1: FR */
-    {-0.0918f,  0.11835f },  /* module 2: RL */
-    {-0.0918f, -0.11835f },  /* module 3: RR */
+    { 0.105f,  0.1325f },  /* module 0: FL */
+    { 0.105f, -0.1325f },  /* module 1: FR */
+    {-0.105f,  0.1325f },  /* module 2: RL */
+    {-0.105f, -0.1325f },  /* module 3: RR */
 };
-static const MotorID SWERVE_MODULE_MOTOR[SWERVE_NUM_MODULES] = { MOTOR1, MOTOR2, MOTOR3, MOTOR4 };
+/* 모듈 -> 구동모터.  2026-10-03 확정: 모터 번호 배치는 조향 서보와 같다.
+ *     MOTOR1 LF   MOTOR3 RF
+ *     MOTOR2 LB   MOTOR4 RB
+ * 모듈 순서는 FL, FR, RL, RR 이므로 {MOTOR1, MOTOR3, MOTOR2, MOTOR4}. */
+static const MotorID SWERVE_MODULE_MOTOR[SWERVE_NUM_MODULES] = { MOTOR1, MOTOR3, MOTOR2, MOTOR4 };
+
+/* 모듈 -> 조향 서보 인덱스 (joint_config[] 인덱스 = 서보 ID - 1).
+ *     서보1 LF   서보3 RF
+ *     서보2 LB   서보4 RB
+ * 모듈 순서는 FL, FR, RL, RR 이므로 {서보1, 서보3, 서보2, 서보4}. */
+static const uint8_t SWERVE_MODULE_SERVO[SWERVE_NUM_MODULES] = { 0, 2, 1, 3 };
+
+/* ★ 조립 후 확인 (TODO): 구동모터·엔코더 부호. 지금은 전부 +1 (미확인).
+ * 좌우 모터가 거울 대칭으로 달리면 한쪽은 -1 이어야 한다. 틀리면 V 0.1 0 0 이
+ * 전진이 아니라 제자리 회전이 된다.  확인 방법 (바퀴를 띄운 상태):
+ *   1) MTEST 로 모터를 하나씩 돌려 MOTOR1..4 가 어느 바퀴인지 -> SWERVE_MODULE_MOTOR
+ *   2) V 0.05 0 0 에서 전진 방향으로 안 도는 바퀴 -> 그 모터의 MOTOR_DRIVE_SIGN = -1
+ *   3) 그 상태에서 LOG 의 m/s 가 음수로 나오는 바퀴 -> ENCODER_SIGN = -1
+ * 인덱스는 MOTOR1..MOTOR4 (모듈 순서가 아님). 옵시디언 "실기 확인 목록" 에도 기록. */
+/* 구동·엔코더 부호.  인덱스는 모터 번호: MOTOR1 LF, MOTOR2 LB, MOTOR3 RF, MOTOR4 RB.
+ *
+ * 모터는 넷 다 같은 방식으로 단다 (몸체 안에서 바깥을 보고, 샤프트에 바퀴).
+ * 그래서 같은 duty + 면 넷 다 샤프트 기준 같은 방향으로 돌고, 샤프트가 좌우로
+ * 반대를 보므로 **왼쪽과 오른쪽은 반대로 구른다** -> 부호는 L 끼리 같고 R 끼리 같다.
+ *
+ * 2026-10-03 로버에 달고 확인: LF·LB 는 duty + 에서 후진 -> L = -1, RB 는 전진 -> R = +1.
+ * (RF 는 -1 로 관찰됐지만 대칭에 맞지 않아 +1 로 둔다. V 0.05 0 0 에서 RF 만 뒤로
+ *  구르면 RF 모터 출력선(M+/M-)이 반대로 꽂힌 것 -> 부호가 아니라 **선을 바꿔** 고친다.
+ *  부호로 덮으면 RF 의 엔코더 부호만 어긋난다.)
+ *
+ * 엔코더는 전원선과 무관하게 실제 회전을 센다. MOTOR1 이 duty + 에서 tick + 였으므로
+ * (bench 실측) 전진할 때 + 가 되려면 ENCODER_SIGN = MOTOR_DRIVE_SIGN.
+ * 확인: V 0.05 0 0 에서 넷 다 앞으로 구르고, LOG 의 M1~M4 m/s 가 넷 다 + . */
+static const int8_t MOTOR_DRIVE_SIGN[MOTOR_COUNT] = { -1, -1, +1, +1 };
+static const int8_t ENCODER_SIGN[MOTOR_COUNT]     = { -1, -1, +1, +1 };
 
 /* Placeholder until bench-measured (free-spin m/s at 100% duty, see
  * mdd3a_driver.h's open item). Wrong magnitude only scales wheel speed
@@ -127,17 +180,52 @@ static volatile uint8_t cmd_ready = 0;  /**< 1이면 완성된 명령이 있음 
  *  작업 중에는 10Hz x 5줄이 터미널을 덮어버려서 끌 수 있어야 한다. */
 static uint8_t  s_log_enabled = 1;
 
+/** 부팅 모터 자가시험. 예전에는 기본으로 돌아서 전원을 넣으면 첫 주행 명령이 올
+ *  때까지 바퀴가 2~3초씩 무한 반복으로 돌았다 (Pi 부팅 전 로버가 스스로 움직임).
+ *  이제 기본 OFF 이고 터미널 MTEST 로만 켠다. */
+static uint8_t  s_mtest_enabled = 0;
+
+/** 텔레옵 중 5Hz 상태줄 ([CTRL] 받은 vx vy w / 조향각 / duty). 엔코더 로그(LOG)와
+ *  따로 켠다 -- 조이스틱이 보낸 값이 STM 에 제대로 들어오는지 확인용.
+ *  텔레옵이 시작돼도 꺼지지 않는다. 한 줄 ~90B 라 200ms 마다 ~8ms 송신 대기. */
+static uint8_t  s_ctrl_log = 0;
+
 /** 받은 문자를 되돌려 보낼지. 안 그러면 터미널에서 타이핑이 안 보인다.
  *  ISR 에서 송신 대기를 하므로 조이스틱이 연속 전송할 때는 수신 오버런을
  *  유발할 수 있어, 텔레옵이 시작되면 자동으로 꺼진다. */
 static uint8_t  s_echo_enabled = 1;
 
 /* === 텔레옵 상태 === */
-/** 명령이 이 시간 이상 끊기면 모터 정지 (조이스틱 종료/USB 분리 대비) */
+/** 명령이 이 시간 이상 끊기면 목표 속도를 0 으로 (조이스틱 종료/USB·SPI 분리 대비) */
 #define TELEOP_TIMEOUT_MS  500
-static uint8_t  s_teleop_active = 0;      /**< V 명령을 한 번이라도 받으면 1 */
-static uint32_t s_last_v_cmd_ms = 0;      /**< 마지막 V 명령 시각 */
+static uint8_t  s_teleop_active = 0;      /**< 구동 명령을 한 번이라도 받으면 1 */
+static uint32_t s_last_cmd_ms = 0;        /**< 마지막 구동 명령 시각 */
 static uint8_t  s_teleop_timed_out = 0;   /**< 워치독이 이미 정지시켰으면 1 */
+static float    s_cmd_target[3] = {0};    /**< 마지막으로 받은 (vx, vy, omega) */
+static uint8_t  s_cmd_from_spi = 0;       /**< 마지막 명령 출처 (1=SPI, 0=UART) */
+
+/* === 제어주기 결과 (텔레메트리로 나간다) === */
+static float    s_cmd_applied[3] = {0};              /**< 워치독 적용 후 IK 입력 */
+static float    s_steer_goal_rad[SWERVE_NUM_MODULES]; /**< 접은 뒤 목표 조향각 */
+static int16_t  s_duty_applied[SWERVE_NUM_MODULES];   /**< 게이트 적용 후 duty */
+static uint8_t  s_servo_read_err = 0;
+static uint8_t  s_steer_clamped = 0;
+static drive_align_gate_t s_gate;
+
+/* === 센서 (매 제어주기 읽음, 모듈 순서 FL, FR, RL, RR) === */
+/** 읽기 실패한 서보는 이 주기 수만큼 건너뛴다. 응답 없는 서보 하나가 매 주기
+ *  수신 타임아웃(15ms)을 먹어 20ms 주기를 밀어내지 않게 한다. */
+#define SERVO_RETRY_TICKS  25U   /* 0.5 s */
+static JointFeedback_t s_servo_fb[SWERVE_NUM_MODULES];
+static uint8_t  s_servo_valid = 0;                      /**< 비트 m = 모듈 m 이번 주기 유효 */
+static uint8_t  s_servo_skip[SWERVE_NUM_MODULES] = {0}; /**< 남은 건너뛰기 주기 */
+static uint8_t  s_servo_failed[SWERVE_NUM_MODULES] = {0}; /**< 직전 읽기 실패 */
+static int16_t  s_imu_raw[6] = {0};                     /**< gyro xyz, acc xyz */
+static uint8_t  s_imu_valid = 0;
+
+/* === Pi SPI 링크 상태 === */
+static uint8_t  s_spi_seq_echo = 0;       /**< 마지막으로 받아들인 프레임 seq */
+static uint16_t s_spi_rx_err = 0;         /**< 버린 프레임 수 (CRC/동기/길이/비유한값) */
 
 /* USER CODE END PV */
 
@@ -157,7 +245,10 @@ static void MX_USART3_Init(void);
 static void servo_boot_sequence(void);
 static void process_command(const char *cmd);
 static void print_help(void);
-static void Swerve_Drive(float vx, float vy, float omega);
+static void Swerve_Control(float vx, float vy, float omega);
+static void teleop_command(float vx, float vy, float omega, uint8_t from_spi);
+static void pi_spi_poll(void);
+static void read_sensors(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -300,7 +391,7 @@ static void servo_boot_sequence(void)
   printf("\r\n--------------------------------------------------\r\n");
   printf("       STS3215 Servo Bus Initialization            \r\n");
   printf("--------------------------------------------------\r\n");
-  printf("USART3: PB10(TX)/PB11(RX), 1,000,000 bps\r\n");
+  printf("USART3: PB10 Half-Duplex BUS, 1,000,000 bps\r\n");
   printf("Servo Count: %d\r\n\r\n", SERVO_COUNT);
 
   /* 1. 각 서보 PING */
@@ -343,49 +434,183 @@ static void servo_boot_sequence(void)
  * <=90deg shortest-path steering optimization in swerve_ik_compute). */
 static swerve_module_state_t s_swerve_state[SWERVE_NUM_MODULES];
 
-static void Swerve_Drive(float vx, float vy, float omega)
+/* 한 제어주기: 차체 명령 -> IK -> 바퀴별 가동범위로 접기 -> 정렬 게이트
+ *            -> 조향 서보(SYNC_WRITE) + 구동 PWM.
+ * 텔레옵이 시작된 뒤 매 CTRL_PERIOD_MS 마다 호출된다. */
+static void Swerve_Control(float vx, float vy, float omega)
 {
   swerve_module_cmd_t cmd[SWERVE_NUM_MODULES];
-  /* 조향 가동범위 안으로 접기 -- 시뮬과 **같은 C 함수**를 쓴다.
-   * 예전에는 여기서 ±90도 고정 창에 접었는데, 연속각이 경계를 지날 때마다
-   * 179도 강제 반전이 생겨 서보가 0.6초씩 엉뚱한 곳을 봤다 (실측: 에피소드의
-   * 24%). swerve_fold_to_limit 은 직전 명령각에 가장 가까운 등가각을 고른다.
-   * SWERVE_STEER_LIMIT_RAD 는 **배선이 견디는 범위**다 (슬립링 없음). */
+  float lo[SWERVE_NUM_MODULES], hi[SWERVE_NUM_MODULES];
+  float goal[SWERVE_NUM_MODULES], speed[SWERVE_NUM_MODULES];
+
   swerve_ik_compute(vx, vy, omega, SWERVE_MODULES, SWERVE_MAX_WHEEL_MPS,
                      s_swerve_state, cmd);
-  /* unwind 는 끈다(0).  구동 중에는 바퀴가 쉬는 순간이 없어 한 번도 안 걸렸고,
-   * ±180도 에서는 이음매 손실이 이미 에피소드의 3% 수준이다.  웨이포인트에서
-   * 정지하는 구간이 생기면 그때 켜면 된다. */
-  swerve_fold_to_limit(SWERVE_STEER_LIMIT_RAD, 0.0f, 0.0f, s_swerve_state, cmd);
 
-  /* 조이스틱은 20~50Hz 로 계속 명령을 보낸다. 호출마다 모듈당 1줄씩 찍으면
-   * 115200 baud(≈11.5KB/s)를 그대로 포화시켜 루프가 밀리므로 5Hz 로 제한. */
-  static uint32_t last_print_ms = 0;
-  uint32_t print_now = HAL_GetTick();
-  int do_print = (print_now - last_print_ms >= 200);
-  if (do_print) last_print_ms = print_now;
-
-  float angles_deg[SWERVE_NUM_MODULES];
-  for (int i = 0; i < SWERVE_NUM_MODULES; i++)
+  /* 바퀴별 가동범위(joint.c) 안의 등가각 중 직전 명령에 가장 가까운 것을 고른다.
+   * 시뮬과 **같은 C 함수** (swerve_fold_to_limit 은 이 함수의 대칭 버전).
+   * unwind 는 끈다(0) -- 시뮬 기본값과 같다. */
+  for (int m = 0; m < SWERVE_NUM_MODULES; m++)
   {
-    float deg = cmd[i].angle_rad * 180.0f / PI;
-    float speed_mps = cmd[i].speed_mps;
+    float min_deg, max_deg;
+    joint_get_limits_deg(SWERVE_MODULE_SERVO[m], &min_deg, &max_deg);
+    lo[m] = min_deg * PI / 180.0f;
+    hi[m] = max_deg * PI / 180.0f;
+  }
+  swerve_fold_to_range(lo, hi, 0.0f, 0.0f, s_swerve_state, cmd);
 
-    angles_deg[i] = deg;
-
-    float norm = mdd3a_normalize_speed(speed_mps, SWERVE_MAX_WHEEL_MPS);
-    int16_t duty = (int16_t)(norm * (float)PWM_MAX);
-    Motor_SetSpeed(SWERVE_MODULE_MOTOR[i], duty);
-
-    if (do_print)
-    {
-      printf("  module%d: angle=%.1f deg  speed=%.2f m/s  duty=%d\r\n",
-             i, angles_deg[i], speed_mps, duty);
-    }
+  for (int m = 0; m < SWERVE_NUM_MODULES; m++)
+  {
+    goal[m] = cmd[m].angle_rad;
+    speed[m] = cmd[m].speed_mps;
+    s_steer_goal_rad[m] = goal[m];
   }
 
-  /* Moves all 4 steering servos together (SYNC_WRITE under the hood). */
-  on_target_angles_received(angles_deg, SWERVE_NUM_MODULES);
+  /* 조향 목표 전송 (서보 인덱스 순서로 재배열) */
+  float servo_deg[SERVO_COUNT];
+  for (int m = 0; m < SWERVE_NUM_MODULES; m++)
+  {
+    servo_deg[SWERVE_MODULE_SERVO[m]] = goal[m] * 180.0f / PI;
+  }
+  s_steer_clamped = (on_target_angles_received(servo_deg, SERVO_COUNT) > 0);
+
+  /* 구동 정렬 게이트: 큰 방향 전환이면 실제 조향각이 정렬될 때까지 보류.
+   * 실제각은 이번 주기 시작에 읽은 서보 피드백(s_servo_fb)을 쓴다. */
+  int allow = 1;
+  drive_gate_update_goal(&s_gate, goal, speed);
+  if (s_gate.pending)
+  {
+    float actual[SWERVE_NUM_MODULES];
+    for (int m = 0; m < SWERVE_NUM_MODULES; m++)
+    {
+      actual[m] = s_servo_fb[m].angle_deg * PI / 180.0f;
+    }
+    allow = drive_gate_allow(&s_gate, goal, actual, s_servo_valid == 0x0F);
+  }
+
+  for (int m = 0; m < SWERVE_NUM_MODULES; m++)
+  {
+    int16_t duty = 0;
+    if (allow)
+    {
+      float norm = mdd3a_normalize_speed(speed[m], SWERVE_MAX_WHEEL_MPS);
+      duty = (int16_t)(norm * (float)PWM_MAX);
+    }
+    MotorID mot = SWERVE_MODULE_MOTOR[m];
+    Motor_SetSpeed(mot, (int16_t)(duty * MOTOR_DRIVE_SIGN[mot]));
+    s_duty_applied[m] = duty;
+  }
+
+  /* 디버그 출력은 LOG 또는 CTRL 이 켜져 있을 때만, 5Hz, 한 줄.  115200 baud 에서
+   * 한 줄(~90B)도 8ms 를 막으므로 제어주기와 같은 빈도로 찍으면 안 된다.
+   * v 는 워치독 적용 후 실제로 IK 에 들어간 차체 명령 (받은 값 그대로). */
+  static uint32_t last_print_ms = 0;
+  uint32_t print_now = HAL_GetTick();
+  if ((s_log_enabled || s_ctrl_log) && print_now - last_print_ms >= 200)
+  {
+    last_print_ms = print_now;
+    printf("[CTRL] v %+.3f %+.3f %+.3f | deg %.0f %.0f %.0f %.0f | duty %d %d %d %d%s%s\r\n",
+           vx, vy, omega,
+           goal[0] * 180.0f / PI, goal[1] * 180.0f / PI,
+           goal[2] * 180.0f / PI, goal[3] * 180.0f / PI,
+           s_duty_applied[0], s_duty_applied[1], s_duty_applied[2], s_duty_applied[3],
+           s_gate.pending ? " GATE" : "",
+           s_teleop_timed_out ? " WDOG" : "");
+  }
+}
+
+/* 구동 명령 수신 (UART 아스키 V 또는 SPI).  목표값과 시각만 갱신하고,
+ * 실제 출력은 다음 제어주기에서 나간다. */
+static void teleop_command(float vx, float vy, float omega, uint8_t from_spi)
+{
+  if (!isfinite(vx) || !isfinite(vy) || !isfinite(omega))
+  {
+    return;
+  }
+  /* 첫 명령에서 텔레옵으로 전환: 모터 자동 테스트 시퀀스를 멈추지
+   * 않으면 그쪽이 Motor_SetSpeed 로 명령을 계속 덮어쓴다. */
+  if (!s_teleop_active)
+  {
+    s_teleop_active = 1;
+    Motor_StopAll();
+    s_mtest_enabled = 0;
+    /* 연속 수신 중 ISR 이 송신을 기다리면 오버런이 나므로 에코를 끈다 */
+    s_echo_enabled = 0;
+    /* 로그는 USART2 송신을 busy-wait 해서 10Hz 로그 한 번이 루프를 ~30ms 막는다.
+     * 50Hz 제어주기를 지키려면 끈다 (필요하면 LOG 로 다시 켤 수 있다). */
+    s_log_enabled = 0;
+    printf("[텔레옵] 시작 (%s) — 모터 자가시험 중단, 에코·로그 OFF (LOG 로 다시 켜기)\r\n",
+           from_spi ? "SPI" : "UART");
+  }
+  if (s_teleop_timed_out)
+  {
+    printf("[텔레옵] 명령 재개\r\n");
+  }
+  s_cmd_target[0] = vx;
+  s_cmd_target[1] = vy;
+  s_cmd_target[2] = omega;
+  s_cmd_from_spi = from_spi;
+  s_last_cmd_ms = HAL_GetTick();
+  s_teleop_timed_out = 0;
+}
+
+/* 매 제어주기 센서 읽기: 조향 서보 4개 (위치·속도·부하·전압·온도·상태) + IMU.
+ * 서보 한 개 ~0.7ms (대부분 서보 반환 지연 500us), IMU ~0.12ms. */
+static void read_sensors(void)
+{
+  s_servo_valid = 0;
+  int retried = 0;
+  for (int m = 0; m < SWERVE_NUM_MODULES; m++)
+  {
+    if (s_servo_skip[m] > 0)
+    {
+      s_servo_skip[m]--;
+      continue;
+    }
+    /* 실패했던 서보 재시도는 한 주기에 하나만 -- 서보 전원이 꺼져 있으면 넷이
+     * 동시에 타임아웃(각 ~3ms)을 먹어 주기가 밀린다. 나머지는 다음 주기로. */
+    if (s_servo_failed[m])
+    {
+      if (retried) continue;
+      retried = 1;
+    }
+    if (joint_read_feedback(SWERVE_MODULE_SERVO[m], &s_servo_fb[m]))
+    {
+      s_servo_valid |= (uint8_t)(1u << m);
+      s_servo_failed[m] = 0;
+    }
+    else
+    {
+      s_servo_failed[m] = 1;
+      s_servo_skip[m] = SERVO_RETRY_TICKS;
+    }
+  }
+  s_servo_read_err = (s_servo_valid != 0x0F);
+
+  s_imu_valid = (uint8_t)Imu_Read(s_imu_raw);
+}
+
+/* SPI 로 들어온 프레임 처리 (메인 루프에서 호출) */
+static void pi_spi_poll(void)
+{
+  const uint8_t *frame = PiSpi_TakeRxFrame();
+  if (frame == NULL) return;
+
+  spi_link_cmd_t c;
+  if (spi_link_parse_cmd(frame, &c) != SPI_LINK_OK)
+  {
+    s_spi_rx_err++;
+    return;
+  }
+  s_spi_seq_echo = c.seq;
+  if (c.type == SPI_LINK_TYPE_VEL_CMD)
+  {
+    if (!isfinite(c.vx) || !isfinite(c.vy) || !isfinite(c.omega))
+    {
+      s_spi_rx_err++;
+      return;
+    }
+    teleop_command(c.vx, c.vy, c.omega, 1);
+  }
 }
 
 /* ================================================================== */
@@ -445,20 +670,7 @@ static void process_command(const char *cmd)
 
     if (parsed == 3)
     {
-      /* 첫 V 명령에서 텔레옵으로 전환: 모터 자동 테스트 시퀀스를 멈추지
-       * 않으면 그쪽이 Motor_SetSpeed 로 조이스틱 명령을 계속 덮어쓴다. */
-      if (!s_teleop_active)
-      {
-        s_teleop_active = 1;
-        Motor_StopAll();
-        /* 연속 수신 중 ISR 이 송신을 기다리면 오버런이 나므로 에코를 끈다 */
-        s_echo_enabled = 0;
-        printf("[텔레옵] 시작 — 모터 자동 테스트 중단, 에코 OFF (복귀하려면 리셋)\r\n");
-      }
-      s_last_v_cmd_ms = HAL_GetTick();
-      s_teleop_timed_out = 0;
-
-      Swerve_Drive(v[0], v[1], v[2]);
+      teleop_command(v[0], v[1], v[2], 0);
     }
     else
     {
@@ -492,7 +704,15 @@ static void process_command(const char *cmd)
       }
       printf(" (도)\r\n");
 
-      on_target_angles_received(angles, parsed);
+      int clamped = on_target_angles_received(angles, parsed);
+      if (clamped > 0)
+      {
+        printf("[CMD] 경고: %d개 각도가 가동범위(joint.c min/max_deg)로 잘림\r\n", clamped);
+      }
+      if (s_teleop_active)
+      {
+        printf("[CMD] 텔레옵 중에는 다음 제어주기가 조향을 덮어씁니다\r\n");
+      }
     }
     else
     {
@@ -529,7 +749,7 @@ static void process_command(const char *cmd)
      * 이 루프가 메인 루프를 막음. 그동안 모터가 계속 돌지 않도록 정지. */
     Motor_StopAll();
 
-    printf("[SCAN] 버스 스캔 (ID 1~253), 약 4초 소요...\r\n");
+    printf("[SCAN] 버스 스캔 (ID 1~253), 약 1초 소요...\r\n");
     int found = 0;
     for (int id = 1; id <= 253; id++)
     {
@@ -649,6 +869,125 @@ static void process_command(const char *cmd)
       printf("     254 = 브로드캐스트, 현재 ID를 몰라도 됨.  예) ID 254 3\r\n");
     }
   }
+  /* --- "GATE" : 구동 정렬 게이트 on/off ---
+   * 서보를 떼고 구동모터만 벤치 시험할 때 끈다. 켜 둔 채로 서보 각을 못 읽으면
+   * 구동이 계속 보류된다 (어느 바퀴가 어디를 보는지 모르면 구동하지 않는다). */
+  else if (cmd_is(cmd, "GATE"))
+  {
+    int on = (s_gate.trigger_rad <= 0.0f);
+    drive_gate_init(&s_gate, on ? DRIVE_GATE_TRIGGER_DEG * PI / 180.0f : 0.0f,
+                    DRIVE_GATE_RELEASE_DEG * PI / 180.0f,
+                    DRIVE_GATE_MAX_HOLD_MS / CTRL_PERIOD_MS);
+    printf("[GATE] 구동 정렬 게이트 %s\r\n", on ? "ON" : "OFF (서보 없이 벤치 시험용)");
+  }
+  /* --- "MOT <1-4|ALL> <duty> <ms>" : 구동모터 부호 확인 (조립 후 1회) ---
+   * MTEST 와 달리 **한 모터를 정확히 한 번** 돌리고 엔코더 변화를 찍는다.
+   * MOTOR_DRIVE_SIGN / ENCODER_SIGN 을 **일부러 적용하지 않는다** -- 지금
+   * 재려는 것이 그 부호 자체이므로, 보정 전의 날 것 관계를 봐야 한다.
+   * 바퀴를 **반드시 띄운 상태**에서 쓴다. */
+  else if (cmd_is(cmd, "MOT"))
+  {
+    if (s_teleop_active)
+    {
+      printf("[MOT] 텔레옵 중에는 못 씁니다 (리셋 후 사용)\r\n");
+    }
+    else
+    {
+      const char *arg = cmd + 3;
+      while (*arg == ' ') arg++;
+
+      int first = 0, last = 0, duty = 0, ms = 0, ok = 0;
+      if (cmd_is(arg, "ALL"))
+      {
+        first = 0; last = MOTOR_COUNT - 1;
+        ok = (sscanf(arg + 3, "%d %d", &duty, &ms) == 2);
+      }
+      else
+      {
+        int idx = 0;
+        ok = (sscanf(arg, "%d %d %d", &idx, &duty, &ms) == 3);
+        if (ok && (idx < 1 || idx > MOTOR_COUNT)) ok = 0;
+        first = last = idx - 1;
+      }
+      if (ok && (duty < -PWM_MAX || duty > PWM_MAX)) ok = 0;
+      if (ok && (ms < 50 || ms > 3000)) ok = 0;
+
+      if (!ok)
+      {
+        printf("[MOT] 사용법: MOT <1-4|ALL> <duty> <ms>\r\n");
+        printf("       duty -%d~+%d, ms 50~3000.  예) MOT 1 300 1000\r\n", PWM_MAX, PWM_MAX);
+        printf("       ** 바퀴를 띄운 상태에서 쓸 것 **\r\n");
+      }
+      else
+      {
+        /* 자가시험 시퀀스가 끼어들어 명령을 덮어쓰지 않게 끈다. */
+        s_mtest_enabled = 0;
+        Motor_StopAll();
+
+        for (int i = first; i <= last; i++)
+        {
+          Encoder_Reset((MotorID)i);
+          int32_t c0 = Encoder_GetCount((MotorID)i);
+
+          Motor_SetSpeed((MotorID)i, (int16_t)duty);   /* 부호 보정 없이 그대로 */
+          HAL_Delay((uint32_t)ms);
+          Motor_SetSpeed((MotorID)i, 0);
+
+          int32_t c1 = Encoder_GetCount((MotorID)i);
+          int32_t d  = c1 - c0;
+          /* 16비트 타이머는 65536 틱(=7.8회전)마다 감싸므로 접어준다. */
+          if (!Encoder_IsWide((MotorID)i)) d = (int32_t)(int16_t)(c1 - c0);
+
+          float rev = (float)d / TICKS_PER_REV;
+          printf("[MOT] MOTOR%d duty=%+d %dms -> 엔코더 %+ld tick (%+.3f rev, %+.1f rpm)\r\n",
+                 i + 1, duty, ms, (long)d, rev, rev * 60000.0f / (float)ms);
+          if (d == 0)
+          {
+            printf("      엔코더 0 -- 배선·전원·듀티 확인 (듀티가 너무 작아 기동 못 했을 수 있음)\r\n");
+          }
+          else
+          {
+            printf("      => duty %c 일 때 이 엔코더는 %c 로 센다\r\n",
+                   duty >= 0 ? '+' : '-', d > 0 ? '+' : '-');
+          }
+          HAL_Delay(200);   /* 관성이 멎을 시간 */
+        }
+        Motor_StopAll();
+        printf("[MOT] 완료. 바퀴가 **전진 방향**으로 돈 duty 부호를 기록할 것.\r\n");
+        printf("      전진이 duty - 였으면 그 모터의 MOTOR_DRIVE_SIGN = -1\r\n");
+        printf("      전진인데 tick 이 - 였으면 그 모터의 ENCODER_SIGN = -1\r\n");
+      }
+    }
+  }
+  /* --- "CTRL [ON|OFF]" : 텔레옵 상태줄 (받은 vx vy w) on/off ---
+   * 인자 없으면 토글. 조이스틱 --monitor 가 시작할 때 "CTRL ON" 을 보낸다. */
+  else if (cmd_is(cmd, "CTRL"))
+  {
+    const char *arg = cmd + 4;
+    while (*arg == ' ') arg++;
+    if (cmd_is(arg, "ON"))       s_ctrl_log = 1;
+    else if (cmd_is(arg, "OFF")) s_ctrl_log = 0;
+    else                         s_ctrl_log = !s_ctrl_log;
+    printf("[CTRL] 상태줄 %s (텔레옵 중 5Hz: 받은 v / 조향각 / duty)\r\n",
+           s_ctrl_log ? "ON" : "OFF");
+  }
+  /* --- "MTEST" : 모터 자가시험 on/off (텔레옵 전만) ---
+   * 모터를 하나씩 정/역 2초씩 돌린다. 바퀴를 띄운 상태에서 모터 번호·방향
+   * 확인용. 첫 구동 명령이 오면 자동으로 멈춘다. */
+  else if (cmd_is(cmd, "MTEST"))
+  {
+    if (s_teleop_active)
+    {
+      printf("[MTEST] 텔레옵 중에는 못 켭니다 (리셋 후 사용)\r\n");
+    }
+    else
+    {
+      s_mtest_enabled = !s_mtest_enabled;
+      Motor_StopAll();
+      printf("[MTEST] 모터 자가시험 %s\r\n",
+             s_mtest_enabled ? "ON — 바퀴를 띄우세요" : "OFF");
+    }
+  }
   /* --- "HELP" : 사용법 --- */
   else if (strncmp(cmd, "HELP", 4) == 0 || strncmp(cmd, "help", 4) == 0)
   {
@@ -677,13 +1016,19 @@ static void print_help(void)
   printf("  ON           : 토크 ON\r\n");
   printf("  OFF          : 토크 OFF\r\n");
   printf("  PING         : 서보 연결 확인 (ID 1~4)\r\n");
-  printf("  SCAN         : 버스 전체 스캔 (ID 1~253, 약 4초)\r\n");
+  printf("  SCAN         : 버스 전체 스캔 (ID 1~253, 약 1초)\r\n");
   printf("  ID <현재> <새> : 서보 ID 변경 [1개만 연결한 상태에서!]\r\n");
   printf("                 예) ID 254 3   (254=브로드캐스트)\r\n");
   printf("  ZERO <id|ALL>: 현재 자세를 0도로 영점 기록 [EEPROM 저장]\r\n");
   printf("                 순서) OFF -> 정면 정렬 -> ZERO ALL -> ON\r\n");
+  printf("  MOT <n|ALL> <duty> <ms> : 구동모터 1개를 날 부호로 돌리고\r\n");
+  printf("                 엔코더 변화 출력 [바퀴 띄우고!]  예) MOT 1 300 1000\r\n");
+  printf("  MTEST        : 모터 자가시험 시퀀스 on/off\r\n");
   printf("  LOG          : 주기 엔코더 로그 on/off (기본 ON)\r\n");
   printf("  ECHO         : 입력 문자 에코 on/off (기본 ON)\r\n");
+  printf("  GATE         : 구동 정렬 게이트 on/off (기본 ON)\r\n");
+  printf("  CTRL [ON|OFF]: 텔레옵 상태줄 (받은 vx vy w, 조향각, duty) 5Hz\r\n");
+  printf("  MTEST        : 모터 자가시험 on/off (기본 OFF, 바퀴 띄우고)\r\n");
   printf("  HELP         : 이 도움말\r\n");
   printf("========================================\r\n");
 }
@@ -742,6 +1087,12 @@ int main(void)
   sts_init();                 /* STS3215 드라이버 초기화 */
   MX_USART2_RxInt_Init();     /* USART2 RX 인터럽트 활성화 */
   servo_boot_sequence();      /* PING → 토크 ON → 준비 완료 메시지 */
+  drive_gate_init(&s_gate, DRIVE_GATE_TRIGGER_DEG * PI / 180.0f,
+                  DRIVE_GATE_RELEASE_DEG * PI / 180.0f,
+                  DRIVE_GATE_MAX_HOLD_MS / CTRL_PERIOD_MS);
+  PiSpi_Init();               /* SPI2 슬레이브 (Pi 링크, PB12/PB13/PC2/PC3) */
+  printf("IMU (ISM330DHCX, SPI3): %s\r\n",
+         Imu_Init() ? "OK" : "응답 없음 (배선/CS=PC9 확인, 1초마다 재시도)");
 
   HAL_Delay(1000);
   /* USER CODE END 2 */
@@ -756,7 +1107,15 @@ int main(void)
    * 8384 tick/rev 이므로 20ms 창에서도 분해능이 충분하다:
    *     0.20 m/s -> 119 tick / 20ms,   0.02 m/s -> 12 tick / 20ms */
   uint32_t last_enc_time = HAL_GetTick();
-  const uint32_t ENC_PERIOD_MS = 20U;          /* 50 Hz.  PI 를 넣으면 100~200Hz 로 */
+  /* 속도 계산용 dt 는 CPU 사이클 카운터로 잰다. HAL_GetTick(1ms) 로 20ms 창을
+   * 재면 19/20/21ms 가 섞여 속도에 샘플마다 ±5% 잡음이 생긴다.
+   * 16MHz 에서 32비트 카운터는 268초마다 랩하지만 차분만 쓰므로 문제없다. */
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+  uint32_t last_enc_cyc = DWT->CYCCNT;
+  const uint32_t ENC_PERIOD_MS = CTRL_PERIOD_MS;  /* 50 Hz 제어주기와 같이 돈다 */
+  uint8_t ctrl_tick = 0;
   uint32_t step_start_time = HAL_GetTick();
   uint8_t step = 0;
 
@@ -775,7 +1134,9 @@ int main(void)
     /* 1a. 엔코더 속도 추정 (50 Hz, 로깅과 독립) */
     if (now - last_enc_time >= ENC_PERIOD_MS)
     {
-      float dt = (float)(now - last_enc_time) / 1000.0f;
+      uint32_t cyc = DWT->CYCCNT;
+      float dt = (float)(cyc - last_enc_cyc) / (float)SystemCoreClock;
+      last_enc_cyc = cyc;
       last_enc_time = now;
 
       for (uint8_t i = 0; i < MOTOR_COUNT; i++)
@@ -786,6 +1147,7 @@ int main(void)
          * revolutions, ~6 s at full speed).  Without this fold the rollover
          * reads as a 65535-tick jump -> a ~4700 RPM spike on one wheel. */
         if (!Encoder_IsWide((MotorID)i)) delta_tick = (int16_t)delta_tick;
+        delta_tick *= ENCODER_SIGN[i];   /* 조립 후 확인할 부호 (위 TODO 참고) */
         wheels[i].last_raw_count = current_raw;
         wheels[i].total_count += delta_tick;
 
@@ -799,9 +1161,80 @@ int main(void)
         wheels[i].linear_vel = wheels[i].rad_per_sec * WHEEL_RADIUS_M;
       }
 
+      /* 1a'. 센서 (항상. 텔레옵 전에도 Pi 가 볼 수 있다) */
+      read_sensors();
+      if ((ctrl_tick % 50U) == 0U)
+      {
+        Imu_Check();   /* 1초마다 WHO_AM_I 재확인 / 끊겼으면 재초기화 */
+      }
+
+      /* 1b. 제어주기 (텔레옵 중에만. 그 전에는 모터 자가시험·T 명령이 액추에이터를 쓴다) */
+      if (s_teleop_active)
+      {
+        /* 워치독: 명령이 끊기면 목표를 0 으로.  모터를 직접 끄는 대신 목표를
+         * 0 으로 두어야 다음 주기가 옛 명령을 다시 내보내지 않는다.
+         * 조향은 IK 데드밴드가 마지막 각을 유지한다. */
+        if (now - s_last_cmd_ms > TELEOP_TIMEOUT_MS)
+        {
+          if (!s_teleop_timed_out)
+          {
+            s_teleop_timed_out = 1;
+            printf("[텔레옵] 명령 %dms 이상 끊김 — 정지\r\n", TELEOP_TIMEOUT_MS);
+          }
+          s_cmd_applied[0] = s_cmd_applied[1] = s_cmd_applied[2] = 0.0f;
+        }
+        else
+        {
+          s_cmd_applied[0] = s_cmd_target[0];
+          s_cmd_applied[1] = s_cmd_target[1];
+          s_cmd_applied[2] = s_cmd_target[2];
+        }
+        Swerve_Control(s_cmd_applied[0], s_cmd_applied[1], s_cmd_applied[2]);
+      }
+
+      /* 1c. 텔레메트리 (항상. 텔레옵 전에도 Pi 가 엔코더를 볼 수 있다).
+       *     t_ms 는 **Nucleo 시각** -- Pi 수신시각을 쓰면 전송 지터가 오차가 된다. */
+      {
+        spi_link_telemetry_t t;
+        memset(&t, 0, sizeof t);
+        t.seq_echo = s_spi_seq_echo;
+        t.tick = ctrl_tick++;
+        t.flags = (uint16_t)(
+            (s_teleop_active    ? SPI_TLM_FLAG_TELEOP_ACTIVE  : 0u) |
+            (s_teleop_timed_out ? SPI_TLM_FLAG_WATCHDOG       : 0u) |
+            (s_gate.pending     ? SPI_TLM_FLAG_GATE_PENDING   : 0u) |
+            (s_cmd_from_spi     ? SPI_TLM_FLAG_SRC_SPI        : 0u) |
+            (s_servo_read_err   ? SPI_TLM_FLAG_SERVO_READ_ERR : 0u) |
+            (s_steer_clamped    ? SPI_TLM_FLAG_STEER_CLAMPED  : 0u) |
+            (s_imu_valid        ? SPI_TLM_FLAG_IMU_VALID      : 0u) |
+            (s_gate.timed_out   ? SPI_TLM_FLAG_GATE_TIMEOUT   : 0u));
+        t.t_ms = now;
+        t.cmd_vx = s_cmd_applied[0];
+        t.cmd_vy = s_cmd_applied[1];
+        t.cmd_omega = s_cmd_applied[2];
+        for (int m = 0; m < SWERVE_NUM_MODULES; m++)
+        {
+          const WheelState_t *w = &wheels[SWERVE_MODULE_MOTOR[m]];
+          t.enc_ticks[m] = (int32_t)w->total_count;
+          t.wheel_mps[m] = w->linear_vel;
+          t.steer_rad[m] = s_steer_goal_rad[m];
+          t.duty[m] = s_duty_applied[m];
+          t.steer_meas_rad[m] = s_servo_fb[m].angle_deg * PI / 180.0f;
+          t.steer_speed[m] = s_servo_fb[m].speed;
+          t.steer_load[m] = s_servo_fb[m].load;
+          t.steer_volt[m] = s_servo_fb[m].voltage;
+          t.steer_temp[m] = s_servo_fb[m].temp;
+          t.steer_status[m] = s_servo_fb[m].status;
+        }
+        t.servo_valid = s_servo_valid;
+        memcpy(t.imu, s_imu_raw, sizeof t.imu);
+        t.rx_err = (uint16_t)(s_spi_rx_err + PiSpi_ShortTransfers());
+        spi_link_pack_telemetry(&t, PiSpi_TxBuffer());
+        PiSpi_CommitTx();
+      }
     }
 
-    /* 1b. 로깅 (10 Hz).  printf 는 제어 루프와 절대 같은 주기에 두지 않는다. */
+    /* 1d. 로깅 (10 Hz).  printf 는 제어 루프와 절대 같은 주기에 두지 않는다. */
     if (now - last_log_time >= 100)
     {
       float dt = (float)(now - last_log_time) / 1000.0f;
@@ -830,10 +1263,11 @@ int main(void)
       }  /* if (s_log_enabled) */
     }
 
-    /* 2. Step-by-Step Motor Test Sequence
+    /* 2. Step-by-Step Motor Test Sequence (MTEST 로 켰을 때만)
      *    텔레옵(V 명령)이 시작되면 중단한다. 안 그러면 이 시퀀스가
-     *    Motor_SetSpeed 로 조이스틱 명령을 몇 초마다 덮어쓴다. */
-    if (!s_teleop_active)
+     *    Motor_SetSpeed 로 조이스틱 명령을 몇 초마다 덮어쓴다.
+     *    모터 번호·방향을 보려는 시험이라 MOTOR_DRIVE_SIGN 을 적용하지 않는다. */
+    if (!s_teleop_active && s_mtest_enabled)
     {
     switch (step)
     {
@@ -970,16 +1404,6 @@ int main(void)
     }
     }  /* if (!s_teleop_active) */
 
-    /* 2b. 텔레옵 워치독 — 명령이 끊기면 정지.
-     *     마지막 속도 명령이 그대로 유지되면 조이스틱을 닫거나 USB 가
-     *     빠져도 로버가 계속 굴러간다. */
-    if (s_teleop_active && !s_teleop_timed_out &&
-        (now - s_last_v_cmd_ms > TELEOP_TIMEOUT_MS))
-    {
-      Motor_StopAll();
-      s_teleop_timed_out = 1;
-      printf("[텔레옵] 명령 %dms 이상 끊김 — 모터 정지\r\n", TELEOP_TIMEOUT_MS);
-    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -987,6 +1411,8 @@ int main(void)
     /* 3. 서보 터미널 명령 처리 (비블로킹)
      *    파싱하는 동안 ISR 이 cmd_line 을 덮어쓸 수 있으므로 지역 버퍼로
      *    복사한 뒤 처리한다. */
+    pi_spi_poll();
+
     if (cmd_ready)
     {
       char line[CMD_BUF_SIZE];

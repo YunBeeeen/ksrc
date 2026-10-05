@@ -249,12 +249,16 @@ print("    => " + ("조향 응답 OK" if (t_rise and t_rise < 1.0 and abs(err_ss
 #    "긴 주행에서 조향각이 +-90도를 벗어나 잘린다" 는 버그가 살아 있었다
 #    (실제 경기장 지형에서 명령의 67%, 평균 오차 76.5도).
 #    공간축([5] 횡경사)과 마찬가지로, 보지 않는 축에는 버그가 숨는다.
-print("\n[9] 누적 조향 드리프트 (연속 명령 2000스텝, 서보 범위 ±90도)")
+_lo9 = [C.steer_range_rad(w)[0] for w in C.C_STEER_ORDER]
+_hi9 = [C.steer_range_rad(w)[1] for w in C.C_STEER_ORDER]
+print(f"\n[9] 누적 조향 드리프트 (연속 명령 2000스텝, 바퀴별 가동범위 "
+      f"{list(C.steer_lo_deg)} ~ {list(C.steer_hi_deg)}도)")
 _mods = kc._make_modules(half_w=C.track / 2, half_l=C.axle_x)
 _st = (kc.SwerveModuleState * 4)()
 _vmax = C.mot_w_noload * C.wheel_r
 _rng = np.random.default_rng(0)
 raw, folded = [], []
+_dir_err = 0.0
 _pos = np.zeros(2); _yaw = 0.0
 _goal = np.array([2.0, 1.0])
 for _k in range(2000):
@@ -268,18 +272,26 @@ for _k in range(2000):
     om = float(np.clip(1.2*np.arctan2(vb[1], vb[0] + 1e-6), -0.8, 0.8))
     o9 = kc.swerve_ik_compute(vb[0], vb[1], om, _mods, _vmax, _st)
     a_raw = np.degrees([o9[i].angle_rad for i in range(4)])
+    v_raw = [(o9[i].speed_mps * np.cos(o9[i].angle_rad),
+              o9[i].speed_mps * np.sin(o9[i].angle_rad)) for i in range(4)]
     raw.append(a_raw)
-    # 펌웨어/env 와 동일한 접기: (-180,180] 정규화 후 ±90 안으로 접음
-    a = (a_raw + 180.0) % 360.0 - 180.0
-    a = np.where(a > 90.0, a - 180.0, np.where(a < -90.0, a + 180.0, a))
-    folded.append(a)
+    # 펌웨어/env 와 **같은 C 함수**로 바퀴별 범위 안에 접는다
+    kc.swerve_fold_to_range(_lo9, _hi9, _st, o9)
+    folded.append(np.degrees([o9[i].angle_rad for i in range(4)]))
+    # 접어도 바닥 속도벡터(방향·크기)는 같아야 한다 (각 +180 이면 속도 부호 반전)
+    for i in range(4):
+        vx_f = o9[i].speed_mps * np.cos(o9[i].angle_rad)
+        vy_f = o9[i].speed_mps * np.sin(o9[i].angle_rad)
+        _dir_err = max(_dir_err, abs(vx_f - v_raw[i][0]), abs(vy_f - v_raw[i][1]))
     _pos += np.array([cs*vb[0] - sn*vb[1], sn*vb[0] + cs*vb[1]]) * 0.02
     _yaw += om * 0.02
 raw = np.array(raw); folded = np.array(folded)
-out_raw = 100.0 * np.mean(np.abs(raw) > 90.0)
-clip_err = float(np.mean(np.abs(raw - np.clip(raw, -90, 90))))
-ok9 = (np.abs(folded) <= 90.0 + 1e-6).all()
-print(f"    IK 원시각 범위 {raw.min():8.1f} ~ {raw.max():8.1f}도   |각|>90도 {out_raw:5.1f}%")
+_lo9d = np.array(C.steer_lo_deg); _hi9d = np.array(C.steer_hi_deg)
+out_raw = 100.0 * np.mean((raw < _lo9d) | (raw > _hi9d))
+clip_err = float(np.mean(np.abs(raw - np.clip(raw, _lo9d, _hi9d))))
+ok9 = bool(((folded >= _lo9d - 1e-3) & (folded <= _hi9d + 1e-3)).all() and _dir_err < 1e-4)
+print(f"    IK 원시각 범위 {raw.min():8.1f} ~ {raw.max():8.1f}도   범위 밖 {out_raw:5.1f}%")
 print(f"    그냥 잘랐을 때 평균 오차 {clip_err:6.1f}도   (이게 0 이 아니면 클립은 쓰면 안 됨)")
-print(f"    180도 등가 접기 후 범위 {folded.min():7.1f} ~ {folded.max():7.1f}도")
+print(f"    180도 등가 접기 후 범위 {folded.min():7.1f} ~ {folded.max():7.1f}도   "
+      f"바닥 속도벡터 최대 오차 {_dir_err*1000:.3f} mm/s")
 print("    => " + ("접기 후 전부 서보 범위 안 OK" if ok9 else "!! 접기 실패 !!"))

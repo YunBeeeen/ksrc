@@ -7,5 +7,7 @@ cd "$(dirname "$0")"
 gcc -shared -fPIC -O2 -o libksrc_common.so \
     ../firmware/common/swerve_kinematics.c \
     ../firmware/common/teleop_protocol.c \
+    ../firmware/common/drive_align_gate.c \
+    ../firmware/common/spi_link.c \
     -lm
 echo "built sim/libksrc_common.so"

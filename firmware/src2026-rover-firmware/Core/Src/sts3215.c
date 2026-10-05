@@ -16,7 +16,10 @@ extern uint32_t HAL_GetTick(void);
 
 /* ========================== 내부 상수 ========================== */
 #define STS_TX_TIMEOUT_MS   10   /**< 송신 타임아웃 (ms) */
-#define STS_RX_TIMEOUT_MS   15   /**< 수신 타임아웃 (ms) */
+/** 수신 타임아웃 (ms). 서보 응답은 반환 지연 500us + 수십 us 안에 온다.
+ *  15ms 였을 때는 서보 전원이 꺼진 벤치에서 4개 x 15ms = 60ms 동안 50Hz 제어
+ *  루프가 멈췄다. HAL_GetTick 이 1ms 단위라 실제 대기는 2~3ms. */
+#define STS_RX_TIMEOUT_MS   3
 #define STS_MAX_PACKET_LEN  64   /**< 최대 패킷 크기 */
 
 /* ========================== 레지스터 기반 UART 헬퍼 ========================== */
@@ -41,7 +44,15 @@ static uint8_t sts_uart_recv_byte(uint8_t *byte, uint32_t timeout_ms)
             return 0; /* 타임아웃 */
         }
     }
+    /* 오버런/프레이밍/노이즈 오류: 인터럽트 등으로 바이트를 놓쳤다. 이 패킷은
+     * 이미 깨졌으므로 남은 바이트를 타임아웃까지 기다리지 말고 바로 실패한다.
+     * SR 을 읽은 뒤 DR 을 읽으면 ORE/FE/NE 가 지워진다. */
+    uint32_t sr = USART3->SR;
     *byte = (uint8_t)(USART3->DR & 0xFF);
+    if (sr & (USART_SR_ORE | USART_SR_FE | USART_SR_NE))
+    {
+        return 0;
+    }
     return 1; /* 수신 성공 */
 }
 
@@ -51,7 +62,8 @@ static uint8_t sts_uart_recv_byte(uint8_t *byte, uint32_t timeout_ms)
 static void sts_flush_rx(void)
 {
     volatile uint8_t dummy;
-    while (USART3->SR & USART_SR_RXNE)
+    /* RXNE 뿐 아니라 남은 ORE 도 지운다 (SR 읽기 -> DR 읽기) */
+    while (USART3->SR & (USART_SR_RXNE | USART_SR_ORE))
     {
         dummy = (uint8_t)(USART3->DR & 0xFF);
         (void)dummy;

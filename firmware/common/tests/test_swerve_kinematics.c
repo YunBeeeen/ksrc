@@ -119,6 +119,32 @@ int main(void)
         expect_near("deadband[0].speed_zero", out[0].speed_mps, 0.0f, 1e-6f);
     }
 
+    /* 8) 비대칭 범위: 모듈 0 만 [0, 180도]. IK 는 -45도(역회전)를 내지만 범위 밖이라
+     *    등가각 135도(정회전)로 옮겨야 한다. 지면 속도벡터 방향은 그대로여야 한다. */
+    {
+        swerve_module_state_t s[SWERVE_NUM_MODULES] = {0};
+        const float lo[SWERVE_NUM_MODULES] = { 0.0f, (float)(-PI), (float)(-PI), (float)(-PI) };
+        const float hi[SWERVE_NUM_MODULES] = { (float)PI, (float)PI, (float)PI, (float)PI };
+        swerve_ik_compute(-0.1f, 0.1f, 0.0f, MODULES, -1.0f, s, out);
+        expect_near("range.ik_angle", out[0].angle_rad, (float)(-PI / 4.0), 1e-5f);
+        swerve_fold_to_range(lo, hi, 0.0f, 0.0f, s, out);
+        expect_near("range[0].angle", out[0].angle_rad, (float)(3.0 * PI / 4.0), 1e-5f);
+        expect_near("range[0].vx", out[0].speed_mps * cosf(out[0].angle_rad), -0.1f, 1e-5f);
+        expect_near("range[0].vy", out[0].speed_mps * sinf(out[0].angle_rad), 0.1f, 1e-5f);
+        expect_near("range[1].angle_unchanged", out[1].angle_rad, (float)(-PI / 4.0), 1e-5f);
+    }
+
+    /* 9) 폭 < 180도: 표현 불가능한 방향은 경계로 클램프 (범위를 절대 넘지 않음) */
+    {
+        swerve_module_state_t s[SWERVE_NUM_MODULES] = {0};
+        const float lo[SWERVE_NUM_MODULES] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        const float hi[SWERVE_NUM_MODULES] = { (float)(PI / 4.0), (float)(PI / 4.0),
+                                               (float)(PI / 4.0), (float)(PI / 4.0) };
+        swerve_ik_compute(-0.1f, 0.1f, 0.0f, MODULES, -1.0f, s, out);
+        swerve_fold_to_range(lo, hi, 0.0f, 0.0f, s, out);
+        expect_near("narrow[0].clamped_hi", out[0].angle_rad, (float)(PI / 4.0), 1e-6f);
+    }
+
     if (g_fail) {
         printf("\nSOME TESTS FAILED\n");
         return 1;

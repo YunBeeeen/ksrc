@@ -22,3 +22,4 @@ sim/rl/runs/
 .idea/
 .DS_Store
 *~
+.claude/

@@ -25,6 +25,10 @@ Core/Src/sts3215.c \
 Core/Src/joint.c \
 Core/Src/swerve_kinematics.c \
 Core/Src/mdd3a_driver.c \
+Core/Src/drive_align_gate.c \
+Core/Src/spi_link.c \
+Core/Src/pi_spi.c \
+Core/Src/imu_ism330.c \
 Core/Src/stm32f4xx_it.c \
 Core/Src/stm32f4xx_hal_msp.c \
 Core/Src/system_stm32f4xx.c \

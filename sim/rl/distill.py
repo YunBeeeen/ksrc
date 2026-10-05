@@ -18,7 +18,6 @@ import torch.nn as nn
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from env import RoverEnv, OBS_PER_FRAME, HISTORY, PRIV_DIM
-from reward import PRESETS as REWARD_PRESETS
 from nets import AdaptationModule, StudentPolicy, PROPRIO_DIM
 
 
@@ -53,7 +52,7 @@ def main():
     opt = torch.optim.Adam(student.adapt.parameters(), lr=args.lr)
     enc = tp.features_extractor.encoder
 
-    env = RoverEnv(rew=REWARD_PRESETS["balanced"], difficulty=args.difficulty,
+    env = RoverEnv(difficulty=args.difficulty,
                    episode_s=args.episode_s, privileged=True, seed=args.seed)
     obs, _ = env.reset(seed=args.seed)
 

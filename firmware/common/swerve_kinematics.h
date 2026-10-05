@@ -103,6 +103,23 @@ void swerve_fold_to_limit(float limit_rad, float unwind_rad, float slow_mps,
                           swerve_module_state_t state[SWERVE_NUM_MODULES],
                           swerve_module_cmd_t out[SWERVE_NUM_MODULES]);
 
+/*
+ * swerve_fold_to_limit 의 바퀴별·비대칭 버전. 모듈 i 의 조향각을
+ * [lo_rad[i], hi_rad[i]] 안으로 접는다 (swerve_fold_to_limit 은 모든 모듈에
+ * [-limit, +limit] 를 넣어 이 함수를 부른다).
+ *
+ * 바퀴마다 배선·구동모터 위치가 달라 가동범위가 다를 때 쓴다.
+ *   - 폭(hi - lo) >= PI 여야 모든 방향을 표현할 수 있다. 폭이 딱 PI 면 방향마다
+ *     등가각이 하나뿐이라 이음매를 지날 때마다 180도 반전이 생긴다.
+ *   - 폭 < PI 면 표현 불가능한 방향은 가까운 경계로 클램프한다 (기구 보호 우선).
+ *   - unwind_rad 는 범위 **중앙**((lo+hi)/2)으로부터의 거리로 해석한다.
+ */
+void swerve_fold_to_range(const float lo_rad[SWERVE_NUM_MODULES],
+                          const float hi_rad[SWERVE_NUM_MODULES],
+                          float unwind_rad, float slow_mps,
+                          swerve_module_state_t state[SWERVE_NUM_MODULES],
+                          swerve_module_cmd_t out[SWERVE_NUM_MODULES]);
+
 #ifdef __cplusplus
 }
 #endif

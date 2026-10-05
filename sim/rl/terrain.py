@@ -230,9 +230,8 @@ class Curriculum:
 def export_costmap(kind, out_dir, max_slope_deg=None, inflate_m=0.0):
     """주행가능 마스크를 **Nav2 정적 맵**(PGM + YAML)으로 내보낸다.
 
-    우리는 이미 `drivable_mask` 가 로버 물리에서 유도된 통과 가능 판정을 갖고 있다
-    (경사 상한 = 견인력 예산에서 나온 21도).  Nav2 는 그걸 occupancy grid 로 받으면
-    되므로 새로 만들 것이 없다.
+    `drivable_mask` 는 경사·단차의 통과 가능성만 판정한다. 실제 로버의 외접
+    반경은 Nav2 costmap 의 footprint/inflation 에서 별도로 반영한다.
 
     값 규약 (nav2_map_server, `trinary` 모드):
         0   = 점유(lethal)      PGM 픽셀 0
@@ -312,7 +311,7 @@ def soil_field(ex, ey, rng, n=128, amp=0.0, lam=0.20):
     "한쪽 바퀴 슬립으로 yaw 가 틀어지면 되잡기" 다 -- 교란 기구가 없는 세계에서
     학습시키면 다른 과제를 배운 것이 된다.  로버스트성 추가가 아니라 과제 본체다.
 
-    `lam` (상관길이) 은 트랙폭(236.7mm) 보다 조금 작게 둔다.  그래야 좌우 바퀴가
+    `lam` (상관길이) 은 트랙폭(265mm) 보다 조금 작게 둔다.  그래야 좌우 바퀴가
     서로 다른 값을 밟고, 주행 중 패치를 넘어갈 때 **과도 외란**이 생긴다.
     `amp` 는 상대 표준편차이고 난이도에 비례시킨다 (d=0 이면 균일).
     """
@@ -367,6 +366,23 @@ def drivable_mask(Z, ex, ey, max_slope_deg=35.0, max_step=0.04, foot=0.16):
     ok = (slope <= np.radians(max_slope_deg)) & (step <= max_step)
     ok[:ky, :] = ok[-ky:, :] = ok[:, :kx] = ok[:, -kx:] = False   # 경계 여유
     return ok, np.degrees(slope)
+
+
+def center_clearance_mask(drivable, ex, ey, radius):
+    """지형 통과가능 셀로부터 로버 중심이 `radius` 이상 떨어진 경로 마스크.
+
+    `drivable_mask` 의 0.16m 창은 경사·단차를 측정하는 공간 척도이지 로버의
+    실제 충돌 반경이 아니다. 경로 생성에는 별도 중심 이격을 적용한다.
+    Nav2 에는 원본 지형 마스크를 주고 costmap 의 robot_radius 로 이격한다.
+    """
+    if radius < 0 or not np.isfinite(radius):
+        raise ValueError("radius 는 0 이상의 유한한 값이어야 합니다")
+    mask = np.asarray(drivable, dtype=bool)
+    if radius == 0:
+        return mask.copy()
+    from scipy.ndimage import distance_transform_edt
+    return mask & (distance_transform_edt(mask, sampling=(ey / mask.shape[0],
+                                                          ex / mask.shape[1])) >= radius)
 
 
 def flat_spawn_mask(drivable, slope_deg, ex, ey, max_slope_deg, clearance_m):
@@ -426,7 +442,10 @@ def line_clear(mask, ex, ey, p0, p1, step=0.04):
     """
     ny, nx = mask.shape
     d = np.linalg.norm(np.asarray(p1) - np.asarray(p0))
-    n = max(int(d / step), 2)
+    # 4cm 간격은 규사맵의 8.3mm 셀 여러 개를 건너뛴다. 최소 셀 폭의
+    # 절반 이하로 샘플링해 가는 장애물을 지나치지 않도록 한다.
+    step = min(step, 0.5 * min(ex / nx, ey / ny))
+    n = max(int(np.ceil(d / step)) + 1, 2)
     t = np.linspace(0.0, 1.0, n)[:, None]
     pts = np.asarray(p0)[None, :] * (1 - t) + np.asarray(p1)[None, :] * t
     jx = np.clip(((pts[:, 0] + ex / 2) / ex * nx).astype(int), 0, nx - 1)

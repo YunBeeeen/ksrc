@@ -28,37 +28,55 @@
  *   5. 재빌드 후 "ON" → "T 0 0" 입력하여 0도 위치 확인
  */
 static JointConfig_t joint_config[SERVO_COUNT] = {
-    /* idx 0: 서보 ID=1, 좌측 조향 (또는 원하는 위치) */
+    /*
+     * 서보 ID <-> 바퀴 (구동모터가 몸체 안쪽을 향하도록 고정한 배치):
+     *
+     *     서보1 (LF)      서보3 (RF)
+     *     서보2 (LB)      서보4 (RB)
+     *
+     * 기구학 모듈 순서(FL, FR, RL, RR) 와 다르다. 변환은 main.c 의
+     * SWERVE_MODULE_SERVO[] 한 곳에서만 한다.
+     *
+     * min_deg / max_deg 는 **바퀴마다 다를 수 있는 기구 가동범위**다 (배선·구동모터
+     * 간섭). 기구학(swerve_fold_to_range)이 이 값을 그대로 읽어서 범위 안의
+     * 등가각만 고르므로, 여기만 고치면 된다.
+     *   - 폭(max - min) 이 180도 이상이어야 모든 방향을 낼 수 있다.
+     *   - ±100도: 90도(모터가 몸체 안쪽)에 10도 여유. 폭 200도 > 180도라 경계
+     *     근처 20도 구간에서는 등가각 두 개 중 직전 각에 가까운 쪽을 계속 써서,
+     *     90도 부근을 오갈 때마다 180도 반전이 나지 않는다 (히스테리시스).
+     *     바퀴별로 간섭이 다르면 ZERO -> T 로 확인해서 따로 바꿀 것.
+     */
+    /* idx 0: 서보1, LF */
     {
         .id      = 1,
-        .offset  = STS_POS_CENTER,  /* 0도 = 2048 (캘리브레이션 후 수정) */
-        .dir     = +1,              /* 양수 각도 = 위치값 증가 방향 */
-        .min_deg = -90.0f,
-        .max_deg = +90.0f,
+        .offset  = STS_POS_CENTER,  /* 0도 = 2048 (ZERO 로 영점 기록) */
+        .dir     = +1,              /* 양수 각도 = 위치값 증가 방향 (T 로 확인) */
+        .min_deg = -100.0f,
+        .max_deg = +100.0f,
     },
-    /* idx 1: 서보 ID=2, 우측 조향 (또는 원하는 위치) */
+    /* idx 1: 서보2, LB */
     {
         .id      = 2,
-        .offset  = STS_POS_CENTER,  /* 0도 = 2048 (캘리브레이션 후 수정) */
-        .dir     = +1,              /* 양수 각도 = 위치값 증가 방향 */
-        .min_deg = -90.0f,
-        .max_deg = +90.0f,
+        .offset  = STS_POS_CENTER,
+        .dir     = +1,              /* 양수 각도 = 위치값 증가 방향 (T 로 확인) */
+        .min_deg = -100.0f,
+        .max_deg = +100.0f,
     },
-    /* idx 2: 서보 ID=3 */
+    /* idx 2: 서보3, RF */
     {
         .id      = 3,
         .offset  = STS_POS_CENTER,
-        .dir     = +1,
-        .min_deg = -90.0f,
-        .max_deg = +90.0f,
+        .dir     = +1,              /* 양수 각도 = 위치값 증가 방향 (T 로 확인) */
+        .min_deg = -100.0f,
+        .max_deg = +100.0f,
     },
-    /* idx 3: 서보 ID=4 */
+    /* idx 3: 서보4, RB */
     {
         .id      = 4,
         .offset  = STS_POS_CENTER,
-        .dir     = +1,
-        .min_deg = -90.0f,
-        .max_deg = +90.0f,
+        .dir     = +1,              /* 양수 각도 = 위치값 증가 방향 (T 로 확인) */
+        .min_deg = -100.0f,
+        .max_deg = +100.0f,
     },
 };
 
@@ -121,17 +139,19 @@ void joint_init(void)
     printf("[Joint] 관절 모듈 초기화 완료!\r\n");
 }
 
-void on_target_angles_received(float *theta, int count)
+int on_target_angles_received(float *theta, int count)
 {
     /*
      * ★ 핵심 콜백 함수 ★
      *
-     * 현재: PC 터미널 파서가 "T 10.5 -20" 명령 수신 시 호출
-     * 나중: SPI 수신 콜백이 라즈베리파이로부터 각도 수신 시 호출
+     * 호출처: 터미널 "T" 명령, 기구학 제어주기(main.c Swerve_Control)
      *
      * 동작:
      *   1. 각도 → 위치값 변환 (범위 클램프 포함)
      *   2. SYNC_WRITE로 모든 서보를 한 사이클에 동시 이동
+     *
+     * 클램프는 조용히 한다 -- 50Hz 제어주기에서 매번 printf 하면 UART 가
+     * 포화된다. 필요한 쪽(T 명령)이 반환값을 보고 알린다.
      */
 
     if (count > SERVO_COUNT) count = SERVO_COUNT;
@@ -139,25 +159,15 @@ void on_target_angles_received(float *theta, int count)
     uint8_t  ids[SERVO_COUNT];
     uint16_t positions[SERVO_COUNT];
     uint16_t speeds[SERVO_COUNT];
+    int clamped = 0;
 
     for (int i = 0; i < count; i++)
     {
         float deg = theta[i];
         const JointConfig_t *cfg = &joint_config[i];
 
-        /* 각도 클램프 (허용 범위 초과 시 경고) */
-        if (deg < cfg->min_deg)
-        {
-            printf("[Joint] 경고: 서보 %d 각도 %.1f° → 클램프 %.1f°\r\n",
-                   cfg->id, deg, cfg->min_deg);
-            deg = cfg->min_deg;
-        }
-        if (deg > cfg->max_deg)
-        {
-            printf("[Joint] 경고: 서보 %d 각도 %.1f° → 클램프 %.1f°\r\n",
-                   cfg->id, deg, cfg->max_deg);
-            deg = cfg->max_deg;
-        }
+        if (deg < cfg->min_deg) { deg = cfg->min_deg; clamped++; }
+        if (deg > cfg->max_deg) { deg = cfg->max_deg; clamped++; }
 
         ids[i]       = cfg->id;
         positions[i] = angle_to_position(cfg, deg);
@@ -166,20 +176,63 @@ void on_target_angles_received(float *theta, int count)
 
     /* SYNC_WRITE로 한 사이클에 모든 서보 동시 이동 */
     sts_sync_write_position(ids, positions, speeds, (uint8_t)count);
+    return clamped;
+}
+
+void joint_get_limits_deg(int idx, float *min_deg, float *max_deg)
+{
+    if (idx < 0 || idx >= SERVO_COUNT) { *min_deg = 0.0f; *max_deg = 0.0f; return; }
+    *min_deg = joint_config[idx].min_deg;
+    *max_deg = joint_config[idx].max_deg;
+}
+
+int joint_read_angle(int idx, float *deg)
+{
+    if (idx < 0 || idx >= SERVO_COUNT) return 0;
+    int16_t pos = sts_read_position(joint_config[idx].id);
+    if (pos < 0) return 0;
+    *deg = position_to_angle(&joint_config[idx], (uint16_t)pos);
+    return 1;
 }
 
 float joint_get_angle(int idx)
 {
     if (idx < 0 || idx >= SERVO_COUNT) return -999.0f;
 
-    int16_t pos = sts_read_position(joint_config[idx].id);
-    if (pos < 0)
+    float deg;
+    if (!joint_read_angle(idx, &deg))
     {
         printf("[Joint] 에러: 서보 ID=%d 위치 읽기 실패\r\n", joint_config[idx].id);
         return -999.0f;
     }
+    return deg;
+}
 
-    return position_to_angle(&joint_config[idx], (uint16_t)pos);
+/* STS 계열의 부호 비트 표현: 크기 + 방향 비트 (2의 보수가 아님) */
+static int16_t sts_signed(uint16_t raw, int sign_bit)
+{
+    uint16_t mag = raw & (uint16_t)((1u << sign_bit) - 1u);
+    return (raw & (1u << sign_bit)) ? (int16_t)-(int16_t)mag : (int16_t)mag;
+}
+
+int joint_read_feedback(int idx, JointFeedback_t *fb)
+{
+    if (idx < 0 || idx >= SERVO_COUNT) return 0;
+    const JointConfig_t *cfg = &joint_config[idx];
+
+    /* 56-57 위치, 58-59 속도, 60-61 부하, 62 전압, 63 온도, 64 비동기플래그, 65 상태 */
+    uint8_t b[10];
+    if (sts_read(cfg->id, STS_REG_PRESENT_POSITION, sizeof b, b) != STS_OK) return 0;
+
+    /* 위치도 부호 비트 15 표현이다 (다회전 모드에서 음수가 나올 수 있다) */
+    int16_t pos = sts_signed((uint16_t)(b[0] | (b[1] << 8)), 15);
+    fb->angle_deg = (float)cfg->dir * ((float)pos - (float)cfg->offset) * 360.0f / 4096.0f;
+    fb->speed   = (int16_t)(cfg->dir * sts_signed((uint16_t)(b[2] | (b[3] << 8)), 15));
+    fb->load    = (int16_t)(cfg->dir * sts_signed((uint16_t)(b[4] | (b[5] << 8)), 10));
+    fb->voltage = b[6];
+    fb->temp    = b[7];
+    fb->status  = b[9];
+    return 1;
 }
 
 void joint_set_speed(uint16_t speed)

@@ -18,8 +18,14 @@ class PolicyPath:
             raise ValueError("path has zero length")
         self.ref = pth.RefPath(pts)
 
-    def features(self, xy, yaw):
-        """Return body-frame lookahead points, signed cross-track and heading errors."""
+    def features(self, xy, yaw, lookahead):
+        """Return route samples, target, and tracking errors in the body frame.
+
+        e_psi 의 기준은 **학습과 같아야 한다** (2026-10-01).  env.py 는 접선
+        heading_at 대신 제어기가 요 명령을 내는 방향 course_at(s, L) 을 쓴다.
+        여기서 heading_at 을 쓰면 정책이 학습 때와 다른 입력을 받는다 --
+        꼭짓점 앞에서 최대 58도까지 어긋난다.
+        """
         ref = self.ref
         xy = np.asarray(xy, dtype=float)
         delta = xy - ref.P[:-1]
@@ -30,26 +36,31 @@ class PolicyPath:
         s = float(ref.S[j] + along[j])
         cross = float(np.cross(ref.U[j], offset[j]))
         e_y = float(np.linalg.norm(offset[j])) * (-1.0 if cross < 0.0 else 1.0)
-        e_psi = pth._wrap(float(yaw) - pth.heading_at(ref, s))
+        e_psi = pth._wrap(float(yaw) - pth.course_at(ref, s, float(lookahead)))
         wp_b = pth.lookahead_body(ref, s, xy, float(yaw))
-        return wp_b, e_y, e_psi
+        target_b = pth.lookahead_body(ref, s, xy, float(yaw),
+                                      dists=(lookahead,))[0]
+        return wp_b, e_y, e_psi, target_b, float(lookahead)
 
 
 def set_route_fields(history, cmd_nom, v_max, features, all_frames=False):
     """Patch the route-related fields in env._frame() without resampling sensors.
 
     Layout in sim/rl/env.py: cmd 0:3, lookahead 23:27, e_y 27,
-    cos/sin(e_psi) 28:30.  A new Nav2 plan replaces route history too.
+    cos/sin(e_psi) 28:30, target 30:32, target_L 32.
+    A new Nav2 plan replaces route history too.
     """
-    wp_b, e_y, e_psi = features
+    wp_b, e_y, e_psi, target_b, target_L = features
     route = np.array([*np.clip(np.asarray(wp_b).ravel(), -2.0, 2.0),
                       np.clip(e_y / 0.3, -3.0, 3.0),
-                      np.cos(e_psi), np.sin(e_psi)], dtype=np.float32)
+                      np.cos(e_psi), np.sin(e_psi),
+                      *np.clip(np.asarray(target_b), -2.0, 2.0), target_L],
+                     dtype=np.float32)
     cmd = np.asarray(cmd_nom, dtype=np.float32) / np.array(
         [v_max, v_max, 3.0], dtype=np.float32)
     frames = history if all_frames else history[-1:]
     for frame in frames:
-        if frame.shape != (33,):
+        if frame.shape != (36,):
             raise ValueError(f"observation frame layout changed: {frame.shape}")
         frame[:3] = cmd
-        frame[23:30] = route
+        frame[23:33] = route

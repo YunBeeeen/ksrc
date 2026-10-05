@@ -1,288 +1,99 @@
 # CLI
 
-0~5절의 학습·평가 명령은 `sim/rl/`에서 실행한다. 6절의 런치는 `ros/`, 조이스틱은
-저장소 루트에서 실행한다.
+이 문서는 **ROS2 / Nav2 / 대회맵 주행** 명령만 담는다. 런치는 `ros/`, 조이스틱은 저장소 루트에서 실행한다.
 
-```bash
-cd ~/ksrc/sim/rl
-```
-
----
-
-## 0. 빌드 / 검증
-
-펌웨어 C 코드를 공유 라이브러리로 빌드한다. **기구학을 수정했으면 반드시 먼저 실행한다** —
-시뮬과 STM32 가 같은 `firmware/common/*.c` 를 쓰기 때문에, 안 하면 정책이 학습한 기구학과
-실기체 기구학이 어긋난다.
-
-```bash
-bash ../build.sh
-```
-
-모델 물리 검증 9종. 인자 없음.
-
-```bash
-python3 check_model.py
-```
-
-| | 검증 |
+| 다른 명령 | 문서 |
 |---|---|
-| [1] | 평지 정착 — 차체 높이, 로커각, 접촉력 합 = 무게 |
-| [2] | 디퍼렌셜 — `rock_L + rock_R = 0` |
-| [3] | 풀스로틀 — 차체속도가 이론 무부하와 일치 |
-| [4] | 비틀림 접지 — 40mm 턱에서 네 바퀴 유지 |
-| [5] | 횡경사 유지 — 슬립모델 ON, 횡방향 접지력 |
-| [6] | 방향별 추종 — 전진/후진/게걸음/대각/제자리회전 |
-| [7] | 요 외란 저항 |
-| [8] | 조향 스텝 응답 |
-| [9] | 누적 조향 드리프트 — 180° 등가 접기 검증 |
-
-견인력 곡선과 고착 재현 검증. 인자 없음.
-
-```bash
-python3 test_terramech.py
-```
+| 학습·증류·평가·재생 (`sim/rl`) | [sim/CLI.md](sim/CLI.md) |
+| 펌웨어 빌드·플래시·터미널·세팅·조이스틱 직결·Pi SPI | [firmware/CLI.md](firmware/CLI.md) |
 
 ---
 
-## 1. 학습
+## 0. 네 가지 조합 — 어느 명령을 쓸지
 
-조향 목표각이 한 주기에 60° 넘게 바뀌는 큰 방향 전환에서는 네 바퀴가 목표의
-10° 이내에 들어올 때까지 구동을 함께 보류하는 규칙이 `RoverEnv`의 기본값이다.
-학습·평가·RViz 순수 IK·RViz RL·텔레옵에 동일하게 적용된다. 평소 작은
-조향 오차마다 멈추지 않도록 큰 전환에만 대기를 시작한다.
-기존 `runs/s2`는 이 규칙과 새 경로추종 보상을 넣기 전에 학습했으므로 새
-보상의 성능 기준으로 간주하지 않는다. 새 정책은 별도 디렉터리에 학습하고
-순수 IK와 짝비교한다. 보상만 비교하려면 같은 명령·시드에
-`--reward position_only`(이동방향 항 없음) 또는 `--reward legacy`(차체 헤딩 항)를 주고
-각각 별도 디렉터리에 학습한다.
+**목표를 어떻게 주느냐**(RViz 클릭 / 텔레옵) × **차체명령을 누가 내느냐**(순수 IK / RL 잔차)
+의 조합이다. 어느 경우든 그 아래 **펌웨어와 같은 공유 C 기구학**
+(`swerve_ik_compute` → `swerve_fold_to_range`)을 지나 MuJoCo 액추에이터로 간다.
 
-```bash
-cd ~/ksrc/sim/rl
-python3 train.py --steps 4000000 --envs 16 --terrain sand --stage1 --out runs/s3_path_reward
-python3 compare_policy.py --model runs/s3_path_reward/final \
-  --vecnorm runs/s3_path_reward/vecnorm.pkl --episodes 240
-```
-
-두 명령의 `--drive-align-gate-deg` 기본값은 대기 해제 오차 10°다. 이전 동작과 비교할 때만
-둘 다 `--drive-align-gate-deg 0`으로 맞춘다.
-
-### teacher (특권 관측)
-
-특권정보 43차원(흙 8 / 로버 3 / 차체속도 3 / 슬립 4 / 침하 4 / 수직항력 4 / 배걸림 2 /
-지형스캔 15)을 인코더로 `z(8)` 에 압축한다. 실기체에서는 못 쓰고, 증류의 교사로만 쓴다.
-
-```bash
-python3 train.py --teacher --steps 4000000 --envs 16 --out runs/teacher
-```
-
-### blind (대조군)
-
-같은 관측 길이인데 특권정보가 없다. teacher-student 구조가 **실제로 값어치가 있는지**
-가르는 기준선이다.
-
-```bash
-python3 train.py --steps 4000000 --envs 16 --out runs/blind
-```
-
-### 인자
-
-| 인자 | 기본값 | 설명 |
-|---|---|---|
-| `--steps` | 4000000 | 총 스텝 |
-| `--envs` | CPU 코어 수 | 병렬 환경. 16 코어면 16 |
-| `--reward` | `balanced` | `speed` / `balanced` / `safe` / `position_only` / `legacy` |
-| `--d0` | 0.0 | 시작 난이도 |
-| `--episode-s` | 20.0 | 에피소드 길이 [초] |
-| `--seed` | 0 | |
-| `--out` | `runs/ppo` | 저장 경로 |
-| `--clip-steer-deg` | 10.0 | 조향 잔차 상한 [도] |
-| `--clip-duty` | 0.60 | 듀티 잔차 상한 |
-| `--teacher` | off | 특권 관측 + 인코더 |
-
-`--clip-steer-deg 0 --clip-duty 0` 으로 주면 순수 기구학 주행이 된다 (ablation).
-
-### 산출물
-
-```
-runs/<이름>/
-  final.zip            최종 정책
-  vecnorm.pkl          관측 정규화 통계  ← 평가할 때 반드시 같이 준다
-  ppo_*_steps.zip      200k 마다 체크포인트
-  ppo_vecnormalize_*.pkl
-  tb/                  텐서보드 로그
-```
-
-> `vecnorm.pkl` 없이 정책만 돌리면 스케일이 어긋난 입력을 받아 결과가 무의미하다.
-
----
-
-## 2. 증류 (teacher → student)
-
-student 는 고유수용감각 이력만으로 `ẑ` 를 맞히도록 배운다. 정책 머리는 **동결**이고
-`AdaptationModule` 만 학습한다. 데이터는 student 가 직접 굴러다니며 모은다 (DAgger).
-
-```bash
-python3 distill.py --teacher runs/teacher/final --vecnorm runs/teacher/vecnorm.pkl
-```
-
-| 인자 | 기본값 | 설명 |
-|---|---|---|
-| `--out` | `runs/teacher/student.pt` | |
-| `--iters` | 30 | DAgger 반복 |
-| `--steps-per-iter` | 6000 | 반복당 수집 스텝 |
-| `--epochs` | 4 | 반복당 회귀 에폭 |
-| `--batch` | 512 | |
-| `--lr` | 1e-3 | |
-| `--w-act` | 0.0 | 행동 손실 가중치. 0 = RMA 설정, >0 = Lee 2020 설정 |
-| `--difficulty` | 1.0 | |
-| `--buffer` | 200000 | 집계 버퍼 |
-
----
-
-## 3. 진단 — 증류를 시작해도 되는지
-
-**성공률만 보면 안 된다.** PPO 가 인코더를 무시하고 고유수용감각만으로 풀어버리면
-`z` 가 죽은 변수가 되고, 성공률은 멀쩡한데 증류할 내용이 없다.
-
-```bash
-python3 probe_teacher.py --model runs/teacher/final --vecnorm runs/teacher/vecnorm.pkl
-```
-
-| | 재는 것 | 판정 |
-|---|---|---|
-| [1] | `z` 의 에피소드 간 표준편차 | max < 0.02 면 인코더가 상수 → 여기서 멈춤 |
-| [2] | `z → 흙 파라미터` 선형 R² | 진단용. 판정용 아님 |
-| [3] | `z` 를 **다른 에피소드 것으로 바꿔치기** 했을 때 낙폭 | 주 판정 |
-
-[3] 은 같은 씨드(= 같은 지형·흙)로 쌍대 비교하고, 목표 도달 수·이동거리 같은
-연속 지표를 주로 본다. 이진 성공률은 24 에피소드에서 표준오차가 10%p 라 검정력이 낮다.
-`z=0` 은 정책이 본 적 없는 분포 밖 입력이라 보조로만 쓴다.
-
-`--episodes` (기본 24), `--difficulty` (기본 1.0) 로 조절한다.
-
----
-
-## 4. 평가
-
-**학습 지형이 아니라 실제 경기장 STL 에서 재는 게 핵심이다.**
-
-```bash
-# 실제 규사 경사지형 (주 평가 대상)
-python3 eval.py --arena --terrain sand --episodes 30 \
-                --model runs/teacher/final --vecnorm runs/teacher/vecnorm.pkl
-
-# 기준선만 (모델 없이)
-python3 eval.py --arena --terrain sand --episodes 30
-
-# 절차생성 랜덤 지형
-python3 eval.py --difficulty 1.0 --episodes 30
-
-# s2 정책을 순수 IK와 같은 시드·미학습 경로에서 직접 짝비교
-python3 compare_policy.py --model runs/s2/final --vecnorm runs/s2/vecnorm.pkl \
-                          --episodes 100
-```
-
-| 인자 | 기본값 | 설명 |
-|---|---|---|
-| `--model` / `--vecnorm` | 없음 | 없으면 기준선만 |
-| `--arena` | off | 실측 STL 로 평가 |
-| `--terrain` | `sand` | `sand`(규사 경사지형, 주) / `rock`(암석 착륙지, 후순위) |
-| `--episodes` | 20 | |
-| `--difficulty` | 0.8 | `--arena` 에서는 **흙에만** 영향 (지형은 항상 실측 STL) |
-| `--reward` | `balanced` | |
-| `--episode-s` | 20.0 | |
-
-### 비교군
-
-| 이름 | 무엇 |
-|---|---|
-| PP+IK | 잔차 0 |
-| 일률감속 ×0.8 / ×0.6 | 기본 차체 명령의 속도를 낮춤 |
-| 경사스케줄 | IMU 피치로 속도 상한 조정 |
-| RL 3-D | 차체속도 `(Δvx, Δvy, Δω)` 잔차 |
-
-`eval.py`는 성능·고착 원인·경로오차·잔차 사용량을 출력한다. 정책 대 순수 IK의
-직접 판정은 `compare_policy.py`의 짝비교와 95% 신뢰구간을 사용한다.
-
----
-
-## 5. 보기
-
-### MuJoCo 뷰어
-
-창이 떠야 하므로 **터미널에서 `!` 를 붙여 직접 실행한다.**
-
-```bash
-! cd ~/ksrc/sim/rl && python3 view.py
-```
-
-| 인자 | 기본값 | 설명 |
-|---|---|---|
-| `--terrain` | `sand` | `sand` / `rock` / `proc`(절차생성) |
-| `--d` | 1.0 | 난이도 |
-| `--model` / `--vecnorm` | 없음 | 없으면 순수 IK |
-| `--seed` | 0 | 바꾸면 다른 맵 |
-| `--static` | off | 물리 끄고 지형만 (제일 가벼움) |
-| `--realtime` | 1.0 | 재생 배속. 0.3 이면 슬립 관찰용 |
-
-마우스: 좌드래그 회전 / 우드래그 이동 / 휠 줌. 스페이스 일시정지.
-에피소드가 끝나면 결과를 찍고 자동 리셋한다.
-
-### 텐서보드
-
-```bash
-! cd ~/ksrc/sim/rl && tensorboard --logdir runs/teacher/tb
-# http://localhost:6006
-```
-
-여러 실행을 한 번에 비교하려면 상위 폴더를 준다:
-
-```bash
-! cd ~/ksrc/sim/rl && tensorboard --logdir runs
-```
-
-올라가는 스칼라:
-
-| 그룹 | 내용 |
-|---|---|
-| `rollout/` | success, stuck, tip, oob, slip, sink, goals, dist, frac, f_belly, f_lifted, duty_sat, duty_use, steer_use |
-| `stuck_cause/` | belly, lost_load, blocked, slip_stuck (멈춘 원인 비율) |
-| `curriculum/` | difficulty, success_rate |
-| `train/` | SB3 기본 (loss, entropy, explained_variance, approx_kl …) |
-
-### 텐서보드 없이 돌린 학습
-
-stdout 로그를 사후에 그림으로 만든다.
-
-```bash
-python3 plotlog.py train.log -o trainlog.png
-```
-
-### 모델 2D 단면
-
-```bash
-python3 draw.py
-```
-
----
-
-## 6. 대회맵 주행: RViz 목표 또는 텔레옵
-
-세 모드는 아래처럼 실행한다. **한 번에 하나의 런치만** 띄운다. 기본 지형은 규사
-대회맵이고, 암석 대회맵은 세 명령 모두 `terrain:=rock`으로 바꾼다.
+| | 목표 | 차체명령 | 명령 | 상태 |
+|---|---|---|---|---|
+| **1** | RViz 2D Goal Pose | Nav2 MPPI (순수 IK) | `mode:=nav2` (기본) | ✅ |
+| **2** | RViz 2D Goal Pose | Nav2 MPPI **+ RL 잔차** | `mode:=nav2 rl:=true` | ✅ |
+| **3** | 텔레옵 (조이스틱) | 사람 명령 (순수 IK) | `mode:=teleop` | ✅ |
+| **4** | 텔레옵 (조이스틱) | 사람 명령 **+ RL 잔차** | — | ❌ **불가** |
 
 ```bash
 cd ~/ksrc/ros
 source /opt/ros/humble/setup.bash
-python3 make_maps.py  # 맵 파일이 없거나 지형 생성 코드를 바꿨을 때만
+python3 make_maps.py    # 맵이 없거나 지형 생성 코드를 바꿨을 때만
 
-ros2 launch nav2_ksrc.launch.py terrain:=sand                  # RViz 2D Goal Pose + 순수 IK
-ros2 launch nav2_ksrc.launch.py terrain:=sand rl:=true         # RViz 2D Goal Pose + s2 RL 잔차
-ros2 launch nav2_ksrc.launch.py terrain:=sand mode:=teleop     # 대회맵 + 수동 텔레옵
+# 1. 클릭으로 목표 -> 순수 IK
+ros2 launch nav2_ksrc.launch.py terrain:=sand
+
+# 2. 클릭으로 목표 -> RL 잔차 (기본 모델 = 검증된 s13 @2.0M)
+ros2 launch nav2_ksrc.launch.py terrain:=sand rl:=true
+
+# 3. 텔레옵 -> 순수 IK   (두 번째 터미널에서 조이스틱, 아래)
+ros2 launch nav2_ksrc.launch.py terrain:=sand mode:=teleop
 ```
 
-**텔레옵 모드**는 런치를 켜 둔 채 두 번째 터미널에서 기존 마우스 조이스틱을
+**한 번에 하나의 런치만** 띄운다. 암석 대회맵은 전부 `terrain:=rock`.
+
+### 4번(텔레옵 + RL)이 왜 불가인가
+
+런치가 **거부한다** (`nav2_ksrc.launch.py`):
+
+```python
+if mode == "teleop" and use_rl:
+    raise RuntimeError("teleop 모드에는 /plan 이 없으므로 rl:=true 를 쓸 수 없습니다")
+```
+
+정책 관측에 **기준경로가 들어간다** — lookahead 2점, 횡이탈 `e_y`,
+`cos/sin(e_psi)`, 선행 목표점, 선행거리. 이 값들은 Nav2 `/plan` 에서 나온다
+(`ros/policy_observation.py`). 텔레옵에는 경로가 없으므로 `e_y`·`e_psi` 가
+**정의되지 않는다.** 0 을 채우면 정책이 학습 때 본 적 없는 분포 밖 입력을 받는다.
+
+구조적인 이유다 — 이 정책은 "주행 보조" 가 아니라 **경로추종 보정**이고, 보정할
+경로가 있어야 존재할 수 있다.
+
+> 하고 싶다면: 텔레옵 명령 방향으로 **가상 직선 경로를 합성**해서 넣으면 된다
+> (`e_y = 0`, `e_psi` = 기수와 명령방향 차, lookahead 는 그 직선 위). 학습 분포에
+> 직선·`e_y≈0` 구간이 있으므로 완전히 밖은 아니다. 약 30행 작업이고 아직 안 했다.
+
+> [!tip] 2번의 기본 모델 — `s13 @2.0M` (2026-10-04 검증)
+> 런치 기본값이 `runs/s13_resid/ppo_1999900_steps.zip` 이다. holdout 100 에피소드
+> 짝비교에서 **순수 IK 를 유의하게 이긴 유일한 체크포인트**다 (잡음 ON):
+>
+> | 지표 | 순수 IK | `s13 @2.0M` | |
+> |---|---|---|---|
+> | 횡오차 평균 | 21.68 mm | **19.80 mm** | **−8.7%** |
+> | 횡오차 p90 | 46.58 mm | **42.34 mm** | **−9.1%** |
+> | 기수오차 평균 | 7.38° | **7.12°** | **−3.5%** |
+> | 완주율 | 95.0% | 95.0% | 유지 |
+> | 슬립 평균 | **0.23** | 0.29 | +26% 악화 |
+> | 소요시간 | **8.59 s** | 8.92 s | +3.8% 악화 |
+> | 차체명령 포화 | **2.52%** | 11.68% | 4.6배 악화 |
+>
+> 다른 시드(`--seed0 2000`)와 다른 경로세트(`--path-seed 7777`)에서도
+> **−10.0% / −8.6%** 로 재현된다. 시드 artifact 가 아니다.
+>
+> **단, 잡음 OFF 조건에서는 중립적이다** — 평균 횡오차 15.99 → 16.77mm (비유의),
+> p90 46.26 → 42.75mm (−7.6%, 유의), 완주율 100 → 97%. 즉 **실기 측위가 예상보다
+> 좋으면 이득이 줄어든다.** 측위 품질([[실기 확인 목록]] C1)이 이 정책의 값어치를
+> 직접 정한다.
+>
+> `s9`·`s10`·`s11` 은 **목적 현상이 꺼진 과제**에서 학습·평가됐으므로 성능 판정이
+> 아니었다. `s12`(잡음 ON, `w_resid` 0.06)·`s14`(`w_smooth` 0.06)·`s15`(`sigma_y` 0.05)
+> 는 기각. 자세한 것은 [[RL 주행보조 진행상황]] 2026-10-04.
+
+---
+
+## 1. 대회맵 주행: RViz 목표 또는 텔레옵
+
+실행 명령은 **0절의 표**에 있다. 이 절은 각 모드가 무엇을 띄우고 무엇을 확인하는지,
+그리고 겪은 문제들을 설명한다.
+
+**텔레옵 모드(3번)**는 런치를 켜 둔 채 두 번째 터미널에서 기존 마우스 조이스틱을
 ROS 모드로 실행한다. 왼쪽 패드는 전후·게걸음, 오른쪽 패드 또는 Q/E는 회전,
 스페이스바는 정지다. 패드에서 손을 떼거나 창 포커스를 잃으면 0 명령을 보낸다.
 텔레옵에서 큰 방향 전환 중에는 차체가 거의 멈출 때까지 최대 0.5초 감속한다.
@@ -327,10 +138,10 @@ RViz를 실행한다. `teleop` 모드에서는 브리지·맵 서버·RViz만 �
 Nav2 컨트롤러의 `/cmd_vel`은 브리지가 받아 공유 스워브 IK를 거쳐 **MuJoCo 조향·구동
 액추에이터**에 적용한다. 브리지는 기본적으로 IK 전에 차체 명령을 0.10초 시정수로
 저역통과하고 그 결과를 `/cmd_vel_filtered`에도 발행한다. 0 명령은 지연 없이 정지한다.
-기본은 순수 IK(잔차 0)다. `rl:=true`로 띄우면 `runs/s2/final.zip`과 짝인
-`vecnorm.pkl`을 로드하고 Nav2 `/plan` 기준 관측으로 3D 잔차를 계산한다.
-`s2`는 공통 조향각 게이트 적용 전에 학습했으므로 이 런치는 보정 적용 확인용이다.
-재학습한 모델은 `rl_model:=... rl_vecnorm:=...`로 지정한다.
+기본은 순수 IK(잔차 0)다. `rl:=true`로 띄우면 모델과 짝인 `vecnorm.pkl`을 로드하고
+Nav2 `/plan` 기준 관측으로 3D 잔차를 계산한다. **`rl_model`/`rl_vecnorm` 을 반드시
+명시한다** — 기본값이 `runs/s2/final.zip` 인데 `s2` 는 조향범위 ±180°, 옛 보상,
+옛 `e_psi` 기준으로 학습해 지금 환경과 맞지 않는다 (0절 주의 참고).
 `/rl_action`은 정규화 행동, `/rl_delta`는 요청된 차체속도 보정,
 `/cmd_vel_applied`는 포화 처리 후 실제 IK 입력이다.
 이 런치만으로 실제 STS/Cytron 모터에 명령이 나가지는 않는다.
@@ -342,7 +153,9 @@ STM32의 현재 `Swerve_Drive()`는 조향 명령과 구동 PWM을 바로 보내
 cd ~/ksrc/ros
 source /opt/ros/humble/setup.bash
 ros2 launch nav2_ksrc.launch.py terrain:=sand rl:=true
+# 다른 모델: rl_model:=... rl_vecnorm:=...
 # 필요하면 잔차만 절반으로 줄여 확인: rl_scale:=0.5
+# 주행 중 켜고 끄기: ros2 service call /set_rl std_srvs/srv/SetBool '{data: false}'
 ```
 
 RViz의 **2D Goal Pose**로 목표를 준 뒤 아래 토픽을 보면 정책이 적용됐는지
@@ -536,30 +349,78 @@ ros2 service call /reset_sim std_srvs/srv/Trigger '{}'
 
 ---
 
-## 전형적인 흐름
+## 2. 진단·비교용 런치 옵션 (2026-10-03 추가)
+
+### `/plan` 꺾임각 분포 재기 — **지금 가장 급한 측정**
+
+학습·평가 경로를 만드는 `sim/rl/path.py` `make_path` 가 막혔을 때 선회각 제한을
+170° 까지 풀어서, 실측 꺾임각이 **p90 148~166°, 최대 168°** 다 (헤어핀 — 로버가
+멈춰서 제자리 회전을 해야 통과한다). Nav2 planner 는 그런 경로를 내지 않는다.
+그 차이가 순수 IK 기준선·`s9`·`s10` 판정 전부에 실려 있다.
 
 ```bash
-bash ../build.sh                                    # 기구학 C 빌드
-python3 check_model.py                              # 물리 9종 통과 확인
+# 터미널 1: Nav2 (1번과 동일)
+cd ~/ksrc/ros && source /opt/ros/humble/setup.bash
+ros2 launch nav2_ksrc.launch.py terrain:=sand
 
-python3 train.py --teacher --envs 16 --out runs/teacher      # ~50분
-python3 probe_teacher.py --model runs/teacher/final \
-        --vecnorm runs/teacher/vecnorm.pkl          # z 를 쓰는가? 아니면 여기서 멈춤
-
-python3 distill.py --teacher runs/teacher/final \
-        --vecnorm runs/teacher/vecnorm.pkl          # student 증류
-python3 train.py --envs 16 --out runs/blind                  # 대조군 ~50분
-
-python3 eval.py --arena --terrain sand --episodes 30 \
-        --model runs/teacher/final --vecnorm runs/teacher/vecnorm.pkl
+# 터미널 2: /plan 집계
+cd ~/ksrc/ros && source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=77 ROS_LOCALHOST_ONLY=1
+python3 plan_stats.py
+#  -> RViz 의 2D Goal Pose 로 목표를 10~20개 찍고 Ctrl-C
+#  -> 누적 꺾임각 분포 + make_path 와의 비교가 출력된다
 ```
 
----
+`--resample` 기본값 0.264 m 는 **pure pursuit 의 선행거리 L** 과 같다. Nav2 경로는
+점 간격이 코스트맵 해상도(0.02 m 급)라 점마다 재면 양자화 잡음이 지배한다
+(직각 90° 1회를 0.02 m 로 재면 평균 0.9°, 0.264 m 로 재면 15.0°).
 
-## 주의
+### 조향 가동범위 바꿔 보기
 
-- **`pkill -f` 로 학습을 죽이지 말 것.** 패턴이 자기 셸까지 잡아 세션이 같이 죽는다
-  (이 프로젝트에서 네 번 발생). 실행할 때 PID 를 받아두고 그 PID 로 `kill` 한다.
-- `--envs` 는 물리 코어 수를 넘기지 않는다. 16 코어에서 16 이 최대다.
-- 학습 중에는 CPU 가 포화되므로 뷰어·평가를 같이 돌리면 둘 다 느려진다.
-- 기하(`config.py`)를 바꾸면 이전 정책은 못 쓴다. teacher 부터 다시 돌려야 한다.
+```bash
+ros2 launch nav2_ksrc.launch.py terrain:=sand mode:=teleop steer_limit_deg:=135
+```
+
+| 한계 | 이력 | 게이트 | 슬립 | `\|조향각\|>110°` (모터가 타이어 밖) |
+|---|---|---|---|---|
+| ±100° (기본) | 20° | 10.85% | 0.198 | **0.00%** |
+| ±135° | 90° | **7.85%** | **0.175** | **3.25%** |
+
+±135° 는 게이트·슬립을 개선하지만 주행 중 3.25% 의 시간에 **모터가 로버의 최외곽**이
+된다 (최대 돌출 36.5 mm, 좌우 전폭 328→401 mm). 그 최외곽이 굴러가는 타이어가 아니라
+고정 하우징이라 턱에 걸린다. 180° 반전 횟수는 **범위와 무관하게 360° 스윕 당 2회로
+고정**이고 위치만 밀린다 (±100 → 100°/280°, ±135 → 136°/315°).
+
+### 접기 선택을 "모터가 차체 안쪽" 으로 바꿔 보기
+
+```bash
+ros2 launch nav2_ksrc.launch.py terrain:=sand mode:=teleop mech_fold:=true
+```
+
+조향각 θ 와 θ±180° 는 바퀴 속도 부호를 뒤집으면 **차체 운동이 완전히 동일**하다.
+구동모터가 바퀴 축과 동축이라 θ=±90° 에서 차체 전방/후방을 향하므로, **앞 모듈은
+뒤로, 뒤 모듈은 앞으로** 접으면 네 모터가 가운데로 모인다:
+
+| 횡걸음 조합 | 모터 외접반경 | 전후 치수 |
+|---|---|---|
+| `+90 +90 +90 +90` (기본 규칙이 내는 것) | 217.3 mm | 364.6 mm |
+| `FL−90 FR+90 RL+90 RR−90` (`mech_fold:=true`) | **118.4 mm** | **2.6 mm** |
+
+> [!warning] **채택안이 아니다.** 파이썬 시뮬 전용이고 공유 C 에 없다
+> in-loop 짝비교(100 에피소드, 순수 IK): 완주율 **96.0 → 71.0%**, 고착 **3 → 28%**,
+> 조향 대기 9.78 → 17.90%. 이력이 없어서 명령 급변 지점마다 분기를 추가 전환한다.
+>
+> 단 그 측정은 **헤어핀 경로 위에서 나온 것**이라 기각 증거가 아니다 — 현실적인
+> 경로에서 재측정해야 한다. **텔레옵(매끄러운 입력)에서는 유효한 거래**다:
+> 360° 스윕 당 반전 2 → 4회, 반전 1회가 약 0.6초, 그리고 게이트 트리거는
+> `driving` 을 요구하므로 속도 0 으로 지나면 공짜다.
+> 자세한 것은 [[조향 회전 제한 설계]].
+
+### 게이트 끄고 비교
+
+```bash
+ros2 launch nav2_ksrc.launch.py terrain:=sand mode:=teleop drive_align_gate_deg:=0
+ros2 launch nav2_ksrc.launch.py terrain:=sand mode:=teleop teleop_guard:=false
+```
+
+조합도 된다: `mech_fold:=true steer_limit_deg:=135 drive_align_gate_deg:=0`

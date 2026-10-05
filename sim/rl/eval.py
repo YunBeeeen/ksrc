@@ -12,7 +12,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent))
 from env import RoverEnv, OBS_PER_FRAME, HISTORY
 
 OBS_DIM = OBS_PER_FRAME * HISTORY
-from reward import PRESETS as REWARD_PRESETS
 
 from traction import SlopeScheduledLimit
 import unicodedata
@@ -65,11 +64,11 @@ def make_baselines():
             ("경사스케줄", slope, sched)]
 
 
-def rollout(policy, n, arena, difficulty, reward, episode_s, seed0=1000,
+def rollout(policy, n, arena, difficulty, episode_s, seed0=1000,
             stateful=None, kind="sand", privileged=False):
     out = []; causes = []
     for i in range(n):
-        e = RoverEnv(rew=REWARD_PRESETS[reward], difficulty=difficulty,
+        e = RoverEnv(difficulty=difficulty,
                      episode_s=episode_s, arena_eval=arena, eval_kind=kind,
                      privileged=privileged, seed=seed0 + i)
         o, _ = e.reset(seed=seed0 + i)
@@ -97,7 +96,6 @@ def main():
     p.add_argument("--vecnorm", default=None)
     p.add_argument("--episodes", type=int, default=20)
     p.add_argument("--difficulty", type=float, default=0.8)
-    p.add_argument("--reward", default="balanced")
     p.add_argument("--episode-s", type=float, default=20.0)
     p.add_argument("--arena", action="store_true", help="실제 경기장 STL 로 평가")
     p.add_argument("--terrain", default="sand", choices=["sand", "rock"],
@@ -132,7 +130,7 @@ def main():
 
     tag = (("규사 경사지형 STL" if args.terrain == "sand" else "암석 착륙지 STL")
            if args.arena else f"랜덤 지형 d={args.difficulty}")
-    print(f"평가: {tag},  {args.episodes} 에피소드,  보상 프리셋 '{args.reward}'\n")
+    print(f"평가: {tag},  {args.episodes} 에피소드\n")
     print(f"{pad('변형',20)} {'보상':>9s} {'목표수':>7s} {'이동 m':>8s} {'슬립':>7s} "
           f"{'침하%':>7s} {'성공%':>6s} {'전복%':>6s} {'고착%':>6s}")
     runs = list(make_baselines())
@@ -141,7 +139,7 @@ def main():
     breakdown = {}
     for name, pol, stateful in runs:
         r, causes = rollout(pol, args.episodes, args.arena, args.difficulty,
-                            args.reward, args.episode_s, stateful=stateful,
+                            args.episode_s, stateful=stateful,
                             kind=args.terrain, privileged=priv)
         breakdown[name] = (r, causes)
         print(f"{pad(name,20)} {r[:,0].mean():+9.1f} {r[:,13].mean():7.2f} "

@@ -6,8 +6,8 @@
 #     (v, omega) 만 내고 스워브의 게걸음(vy)을 통째로 버린다.
 #     MPPI 의 Omni 모션모델은 vy_max / vy_std 를 갖고 있어 vy 를 실제로 명령한다.
 #  2) costmap 에 **인지 레이어가 없다** (static + inflation 만).
-#     로버에 외계 인지가 없고, 통과 불가 영역은 이미 정적 맵에 들어 있다
-#     (terrain.export_costmap 이 경사 21도 상한으로 구운 것).
+#     정적 맵은 경사·단차의 통행 불가 영역만 담는다. 로버의 실제 크기는
+#     robot_radius=0.21m 로 별도 반영한다.
 
 amcl:
   ros__parameters:
@@ -83,7 +83,7 @@ controller_server:
         cost_power: 1
         cost_weight: 3.81
         critical_cost: 300.0
-        consider_footprint: false       # 맵이 풋프린트를 이미 반영 (점 취급)
+        consider_footprint: true        # 후보 궤적 전체에서 실제 로버 크기 확인
         collision_cost: 1000000.0
         near_goal_distance: 0.5
       GoalCritic:
@@ -136,12 +136,12 @@ local_costmap:
       width: 3
       height: 3
       resolution: 0.01
-      # **로버를 점으로 취급한다.**  정적 맵이 이미 풋프린트를 반영한다 --
-      # terrain.drivable_mask 가 0.16m 창으로 경사·단차를 판정하므로 "그 셀에
-      # 로버 중심을 놓으면 괜찮다" 는 뜻이다.  여기서 로버 반경을 다시 팽창시키면
-      # 이중계상이고, 실제로 자유공간이 70.4% -> 28.5% 로 깎여 플래너가 경로를
-      # 못 찾았다 (failed to create plan with tolerance 0.15).
-      robot_radius: 0.01
+      # 휠베이스·트랙과 바퀴반경에서 계산한 외접 반경은 0.2090m (2026-10-03 실측 치수).
+      # drivable_mask 의 0.16m 창은 지형 경사 측정 규모이지 로버 충돌 반경이 아니다.
+      robot_radius: 0.21
+      # MPPI CostCritic 의 consider_footprint 에는 명시적 다각형이 필요하다.
+      # 이 팔각형의 내접 반경은 약 0.210m 로 실제 바퀴 외접원(0.209m)을 포함한다.
+      footprint: "[[0.227, 0.0], [0.161, 0.161], [0.0, 0.227], [-0.161, 0.161], [-0.227, 0.0], [-0.161, -0.161], [0.0, -0.227], [0.161, -0.161]]"
       plugins: [static_layer, inflation_layer]
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
@@ -149,8 +149,7 @@ local_costmap:
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 3.0
-        # 맵이 이미 풋프린트를 반영하므로 작게 둔다 (경계 여유용).
-        inflation_radius: 0.03
+        inflation_radius: 0.24
       always_send_full_costmap: true
 
 global_costmap:
@@ -163,12 +162,8 @@ global_costmap:
       robot_base_frame: base_link
       resolution: 0.01
       track_unknown_space: false
-      # **로버를 점으로 취급한다.**  정적 맵이 이미 풋프린트를 반영한다 --
-      # terrain.drivable_mask 가 0.16m 창으로 경사·단차를 판정하므로 "그 셀에
-      # 로버 중심을 놓으면 괜찮다" 는 뜻이다.  여기서 로버 반경을 다시 팽창시키면
-      # 이중계상이고, 실제로 자유공간이 70.4% -> 28.5% 로 깎여 플래너가 경로를
-      # 못 찾았다 (failed to create plan with tolerance 0.15).
-      robot_radius: 0.01
+      robot_radius: 0.21
+      footprint: "[[0.227, 0.0], [0.161, 0.161], [0.0, 0.227], [-0.161, 0.161], [-0.227, 0.0], [-0.161, -0.161], [0.0, -0.227], [0.161, -0.161]]"
       plugins: [static_layer, inflation_layer]
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
@@ -176,8 +171,7 @@ global_costmap:
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 3.0
-        # 맵이 이미 풋프린트를 반영하므로 작게 둔다 (경계 여유용).
-        inflation_radius: 0.03
+        inflation_radius: 0.24
       always_send_full_costmap: true
 
 map_server:
