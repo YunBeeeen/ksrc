@@ -43,6 +43,23 @@ int Imu_Read(int16_t out[6]);
  */
 int Imu_Check(void);
 
+/**
+ * 새 샘플(가속도·자이로 둘 다)이 있으면 읽어서 이번 제어주기 합에 더한다. 메인 루프에서 1 ms 마다.
+ * ODR 208 Hz 라 20 ms 주기에 3–4 개. 서보 읽기(~3 ms) 동안 하나쯤 놓쳐도 평균은 유지된다.
+ * 이유: 50 Hz 순간값 하나는 차체 진동이 겹쳐 보여(aliasing) 자이로 적분·중력 필터가 틀어진다
+ * (시뮬 거친 지형: 순간값 적분 평균 24° 오차, 주기 평균이면 0.8°. MOTOR_MODELING_PLAN §11).
+ * @param sample  NULL 이 아니면 이번에 읽은 원시 샘플 (ICAP 고속 기록용)
+ * @return 이번에 더했으면 1
+ */
+int Imu_Poll(int16_t sample[6]);
+
+/**
+ * 이번 주기 평균을 꺼내고 합을 비운다. 쌓인 게 없으면 Imu_Read 순간값.
+ * @param n  평균에 들어간 샘플 수 (0 = 순간값) -> 텔레메트리 imu_n
+ * @return   IMU 유효 여부
+ */
+int Imu_TakeMean(int16_t out[6], uint8_t *n);
+
 #ifdef __cplusplus
 }
 #endif

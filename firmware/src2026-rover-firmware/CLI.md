@@ -91,7 +91,7 @@ python3 ~/ksrc/pi/teleop/teleop_joystick.py
 | `GATE` | 없음 | 구동 정렬 게이트 on/off **토글**. 기본 ON. 서보를 떼고 구동모터만 시험할 때 끈다 |
 | `MTEST` | 없음 | 모터 자가시험 on/off **토글**. **기본 OFF**. 모터를 하나씩 정/역 2초씩 돌린다 (바퀴 띄우고). 텔레옵 전에만 |
 
-`T`는 인자 개수만큼만 명령을 보냅니다 — `T 30`은 1번 서보에만, `T 0 30`은 1·2번에만. 각도는 `joint.c`의 서보별 `min_deg`/`max_deg`(현재 전부 ±100°)로 클램프되고, 잘리면 경고가 한 줄 나옵니다.
+`T`는 인자 개수만큼만 명령을 보냅니다 — `T 30`은 1번 서보에만, `T 0 30`은 1·2번에만. 각도는 `joint.c`의 서보별 `min_deg`/`max_deg`(현재 전부 ±90°)로 클램프되고, 잘리면 경고가 한 줄 나옵니다.
 
 `T`의 인자 순서는 **서보 ID 순서**입니다. 바퀴 배치는 다음과 같습니다.
 
@@ -173,7 +173,7 @@ Pi가 SPI 마스터이고 Nucleo SPI2가 슬레이브입니다. 한 번의 전�
 |---|---|---|---|---|
 | 1 | 조향 영점 | 서보 EEPROM | 미설정 | `OFF` → 네 바퀴를 자로 정면 정렬 → `ZERO ALL` → `ON` → `T 0 0 0 0` |
 | 2 | 조향 방향(dir) | `joint.c` `joint_config[].dir` | 전부 +1 | `T 30`(서보1)부터 하나씩: 위에서 볼 때 반시계면 +1, 시계면 -1 |
-| 3 | 조향 가동범위 | `joint.c` `min_deg/max_deg` **+ 시뮬 `sim/rl/config.py` `steer_lo_deg/steer_hi_deg`** | 전부 ±100° | `T`로 천천히 늘려 가며 구동모터·배선 간섭 각 확인. 바퀴마다 달라도 됨. 폭 180° 이상 유지. **두 곳을 같이 고친다** (시뮬은 모듈 순서 FL, FR, RL, RR) |
+| 3 | 조향 가동범위 | `joint.c` `min_deg/max_deg` **+ 시뮬 `sim/rl/config.py` `steer_lo_deg/steer_hi_deg`** | 전부 ±90° | `T`로 천천히 늘려 가며 구동모터·배선 간섭 각 확인. 바퀴마다 달라도 됨. 폭 180° 이상 유지. **두 곳을 같이 고친다** (시뮬은 모듈 순서 FL, FR, RL, RR) |
 | 4 | 구동모터 ↔ 바퀴 | `main.c` `SWERVE_MODULE_MOTOR` | MOTOR1..4 = FL, FR, RL, RR | 바퀴 띄우고 `MTEST` → 어느 바퀴가 도는지 |
 | 5 | 구동 방향 | `main.c` `MOTOR_DRIVE_SIGN` | 전부 +1 | `V 0.05 0 0`에서 뒤로 도는 바퀴의 모터 → -1 |
 | 6 | 엔코더 방향 | `main.c` `ENCODER_SIGN` | 전부 +1 | 5번 후 `LOG`의 m/s가 음수인 모터 → -1 |
@@ -248,10 +248,10 @@ V 0 0 0             정지
 | 항목 | 위치 | 현재 값 |
 |---|---|---|
 | 모듈 장착 위치 | `main.c` `SWERVE_MODULES` | ±0.12 m (트랙·휠베이스 240mm 가정) |
-| 최대 바퀴 속도 | `main.c` `SWERVE_MAX_WHEEL_MPS` | 0.3 m/s |
+| 최대 바퀴 속도 | `main.c` `SWERVE_MAX_WHEEL_MPS` | 0.378 m/s |
 | 모듈↔구동모터 매핑 | `main.c` `SWERVE_MODULE_MOTOR` | 0→MOTOR1 … 3→MOTOR4 (실제 배선 미확인) |
 | 모듈↔서보 매핑 | `main.c` `SWERVE_MODULE_SERVO` | FL→서보1, FR→서보3, RL→서보2, RR→서보4 (배치 확정) |
 | 조향 원점·방향 | `joint.c` `joint_config[]` | offset=2048, dir=+1 (캘리브레이션 전) |
-| 조향 가동범위 | `joint.c` `min_deg/max_deg` | 전부 ±100° (90° + 여유 10°, 바퀴별 간섭 확인 전) |
+| 조향 가동범위 | `joint.c` `min_deg/max_deg` | 전부 ±90° (URDF 관절 한계와 같게, 바퀴별 간섭 확인 전) |
 
 모듈 위치와 최대 속도가 틀려도 방향은 맞고 크기만 어긋납니다. 반면 **원점·방향·매핑이 틀리면 로버가 엉뚱한 방향으로 갑니다.**

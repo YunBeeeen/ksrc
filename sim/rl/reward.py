@@ -108,21 +108,27 @@ class VelRewardCfg:
       못했던 문제가 구조적으로 해결된다.
 
     `exp(-(e/sigma)^2)` 형태는 legged_gym 의 track_lin_vel_xy_exp 와 같다.
-    유계라서 보상이 폭주하지 않고 0 근처에서 기울기가 가장 크다.
+    유계라서 보상이 폭주하지 않지만, 오차 0 과 큰 오차에서는 기울기가
+    작아진다 (최대 기울기는 e=sigma/sqrt(2)). 따라서 p90 개선은 보상
+    상승만으로 판단하지 않고 별도로 측정한다.
     오차는 **무차원화**해서 넣는다 (v_max, omega_max 로 나눔) -- 로버 치수가
     바뀌어도 가중치를 다시 안 잡게.
     """
     w_v:      float = 0.60   # + 병진속도 추종 (vx, vy 합쳐 하나)
     w_om:     float = 0.40   # + 요속도 추종
     # sigma 는 **운용점 기울기와 원거리 학습가능성의 교환**으로 정한다.
-    # 무차원 오차 실측(순수 IK): ||v_xy|| 0.039/0.318 = 0.124, |om| 0.138/1.847 = 0.075
+    # 최초 설정 당시 무차원 오차: ||v_xy|| 0.039/0.318 = 0.124,
+    # |om| 0.138/1.847 = 0.075. 현재 v_max=0.378, om_max=2.258 로
+    # 바뀌었으므로 아래 수치 예시는 당시 스케일이며 실험 지표는 새 스케일로
+    # 다시 계산했다.
     #   sig_v  운용점보상  운용점기울기   e=2배   e=3배
     #    0.12    0.344      5.92       0.014   0.000   <- 2배에서 기울기 死
     #    0.16    0.548      5.31       0.090   0.004   <- 채택
     #    0.25    0.782      3.10       0.374   0.109   <- 기울기 48% 손실
     # 0.12 -> 0.16 은 기울기를 10% 만 잃고 원거리를 6배 살린다.
-    # 더 넓히지 않는 대신 **초기 탐색 std 를 낮춘다** (train.py --log-std-init
-    # -1.0 -> std 0.37).  action scale 이 0.08/0.06/0.35 로 커졌으므로 std 1.0
+    # 더 넓히지 않는 대신 **초기 탐색 std 를 낮춘다** (cmdvel 기본
+    # --log-std-init -2.0 -> std 0.135). 현재 action scale 은
+    # 0.11/0.085/0.45 이므로 std 1.0
     # 이면 초기 오차가 운용점의 3배까지 벌어져 보상이 평평해진다.
     sigma_v:  float = 0.16
     sigma_om: float = 0.13
@@ -131,6 +137,7 @@ class VelRewardCfg:
     # 남겨두는 이유는 실기 액추에이터 떨림 억제뿐이다.
     w_resid:  float = 0.01   # - 평균 a^2
     w_smooth: float = 0.01   # - 2차 차분
+    w_tail:   float = 0.0    # 실험 노브: 큰 속도오차에 계속 기울기를 주는 이차 비용
     r_tip:    float = -10.0
     r_stuck:  float = -5.0
     r_oob:    float = -10.0
@@ -152,6 +159,8 @@ def velocity_terms(v_err_n, om_err_n, action, prev_action, prev2_action, cfg):
     return {
         "track_v":  cfg.w_v * math.exp(-(v_err_n / cfg.sigma_v) ** 2),
         "track_om": cfg.w_om * math.exp(-(om_err_n / cfg.sigma_om) ** 2),
+        "tail": -cfg.w_tail * ((v_err_n / cfg.sigma_v) ** 2 +
+                               (om_err_n / cfg.sigma_om) ** 2),
         "resid":   -cfg.w_resid * float(np.mean(a ** 2)),
         "smooth":  -cfg.w_smooth * float(np.mean(d2 ** 2)),
     }

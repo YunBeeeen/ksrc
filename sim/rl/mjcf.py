@@ -27,7 +27,7 @@ rover.xml 이 이 용도로 알맞은 이유:
   지형          hfield/plane + terrain class.  CAD 에는 무한 평면만 있다.
   조향 가동범위 CAD 의 +-90 도는 **가정값**이다 (model.json/assumptions:
                 "replace with actual wire/mechanical limits").  STEP 실측으로
-                정한 config.steer_*_deg (+-100) 를 쓴다.
+                정한 config.steer_*_deg (+-90) 를 쓴다.
   바퀴 액추에이터 CAD 는 velocity(kv 0.2, forcerange +-1).  우리는 motor(토크,
                 gear = mot_tau_stall 1.96) + 관절감쇠로 **DC 모터 속도 드룹**을
                 모델링한다.  env._reward 의 토크/전력 계산

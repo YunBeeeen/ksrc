@@ -34,7 +34,7 @@
   vx vy om> q             종료 (0 을 몇 번 보낸 뒤 포트 닫음)
 
 `[CTRL] deg a b c d duty ...` 가 펌웨어의 5Hz 로그다. `deg` 는 **접기 뒤
-목표 조향각**이라 ±100도 기구학 검증의 관측값이다. |deg| > 100 이 보이면
+목표 조향각**이라 ±90도 기구학 검증의 관측값이다. |deg| > 90 이 보이면
 `swerve_fold_to_range` 가 한계를 못 지킨 것이다 (joint.c 가 조용히 클램프한다).
 `GATE` 는 구동 정렬 게이트가 보류 중이라는 뜻이다.
 """
@@ -53,7 +53,7 @@ PROMPT = "vx vy om> "
 # 펌웨어 main.c 의 5Hz 한 줄 로그
 CTRL_RE = re.compile(r"\[CTRL\]\s+deg\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+"
                      r"duty\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)\s+(-?\d+)(\s+GATE)?")
-STEER_LIMIT_DEG = 100.0     # joint.c joint_config[].min_deg/max_deg 와 같은 값
+STEER_LIMIT_DEG = 90.0      # joint.c joint_config[].min_deg/max_deg 와 같은 값
 
 
 class Link:
@@ -136,7 +136,7 @@ def main():
     p.add_argument("--log", action="store_true",
                    help="펌웨어 [CTRL] 5Hz 로그를 그대로 출력 (A4 측정용)")
     p.add_argument("--no-limit-warn", action="store_true",
-                   help="목표 조향각이 ±100도를 넘을 때 경고하지 않는다")
+                   help="목표 조향각이 ±90도를 넘을 때 경고하지 않는다")
     a = p.parse_args()
     if not 1.0 <= a.hz <= 50.0:
         p.error("--hz 는 1~50 사이여야 한다 (워치독 500ms, 제어주기 20ms)")

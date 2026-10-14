@@ -41,9 +41,11 @@ static JointConfig_t joint_config[SERVO_COUNT] = {
      * 간섭). 기구학(swerve_fold_to_range)이 이 값을 그대로 읽어서 범위 안의
      * 등가각만 고르므로, 여기만 고치면 된다.
      *   - 폭(max - min) 이 180도 이상이어야 모든 방향을 낼 수 있다.
-     *   - ±100도: 90도(모터가 몸체 안쪽)에 10도 여유. 폭 200도 > 180도라 경계
-     *     근처 20도 구간에서는 등가각 두 개 중 직전 각에 가까운 쪽을 계속 써서,
-     *     90도 부근을 오갈 때마다 180도 반전이 나지 않는다 (히스테리시스).
+     *   - ±90도 (2026-10-11, URDF 조향 관절 한계 ±1.5708 과 같게. 예전 ±100도).
+     *     폭이 정확히 180도라 겹치는 구간이 없다: 바퀴 방향이 ±90도를 넘나들면
+     *     (예: 순수 옆걸음 근처) 등가각이 반대쪽 끝으로 바뀌어 180도 반전이 난다.
+     *     그 동안은 drive_align_gate 가 구동을 보류한다. 히스테리시스가 필요하면
+     *     기구 간섭이 허락하는 만큼 다시 넓힐 것 (시뮬 config 와 같이).
      *     바퀴별로 간섭이 다르면 ZERO -> T 로 확인해서 따로 바꿀 것.
      */
     /* idx 0: 서보1, LF */
@@ -51,32 +53,32 @@ static JointConfig_t joint_config[SERVO_COUNT] = {
         .id      = 1,
         .offset  = STS_POS_CENTER,  /* 0도 = 2048 (ZERO 로 영점 기록) */
         .dir     = +1,              /* 양수 각도 = 위치값 증가 방향 (T 로 확인) */
-        .min_deg = -100.0f,
-        .max_deg = +100.0f,
+        .min_deg = -90.0f,
+        .max_deg = +90.0f,
     },
     /* idx 1: 서보2, LB */
     {
         .id      = 2,
         .offset  = STS_POS_CENTER,
         .dir     = +1,              /* 양수 각도 = 위치값 증가 방향 (T 로 확인) */
-        .min_deg = -100.0f,
-        .max_deg = +100.0f,
+        .min_deg = -90.0f,
+        .max_deg = +90.0f,
     },
     /* idx 2: 서보3, RF */
     {
         .id      = 3,
         .offset  = STS_POS_CENTER,
         .dir     = +1,              /* 양수 각도 = 위치값 증가 방향 (T 로 확인) */
-        .min_deg = -100.0f,
-        .max_deg = +100.0f,
+        .min_deg = -90.0f,
+        .max_deg = +90.0f,
     },
     /* idx 3: 서보4, RB */
     {
         .id      = 4,
         .offset  = STS_POS_CENTER,
         .dir     = +1,              /* 양수 각도 = 위치값 증가 방향 (T 로 확인) */
-        .min_deg = -100.0f,
-        .max_deg = +100.0f,
+        .min_deg = -90.0f,
+        .max_deg = +90.0f,
     },
 };
 
@@ -133,6 +135,24 @@ void joint_init(void)
         else
         {
             printf("[Joint] 서보 ID=%d 토크 ON 완료\r\n", id);
+        }
+    }
+
+    /* 목표 속도를 펌웨어 기본값(joint_goal_speed = 0 = 최대)으로 맞춘다. 토크 ON **뒤에** 쓴다.
+     * 위치 SYNC_WRITE 는 속도를 보내지 않아서, 안 하면 서보(12V 따로 켜져 있음)가
+     * STM 리셋 전에 S 로 넣은 값을 계속 기억한다. 들어갔는지 되읽어 찍는다. */
+    joint_set_speed(joint_goal_speed);
+    for (int i = 0; i < SERVO_COUNT; i++)
+    {
+        uint8_t b[2] = { 0, 0 };
+        if (sts_read(joint_config[i].id, STS_REG_GOAL_SPEED, 2, b) == STS_OK)
+        {
+            printf("[Joint] 서보 ID=%d 목표속도 레지스터 = %u\r\n",
+                   joint_config[i].id, (unsigned)(b[0] | (b[1] << 8)));
+        }
+        else
+        {
+            printf("[Joint] 서보 ID=%d 목표속도 되읽기 실패\r\n", joint_config[i].id);
         }
     }
 
@@ -233,6 +253,11 @@ int joint_read_feedback(int idx, JointFeedback_t *fb)
     fb->temp    = b[7];
     fb->status  = b[9];
     return 1;
+}
+
+uint16_t joint_get_speed(void)
+{
+    return joint_goal_speed;
 }
 
 void joint_set_speed(uint16_t speed)

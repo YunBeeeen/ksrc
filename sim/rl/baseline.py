@@ -72,6 +72,8 @@ def main():
     # 34.8mm 를 움직이는데 RL 이 주장하는 개선은 1.88mm 다.  "잡음 ON 에서는
     # 짧은 lookahead 가 발진한다" 는 주장이었고 측정이 아니었으므로, 잡음을
     # 켠 상태에서 직접 재는 길을 열어둔다.
+    p.add_argument("--d-rate-max", type=float, default=None,
+                   help="잔차 변화율 제한 [스텝당 |da|]. 속도 액션은 급격한 변화를 요구할 수 있어 실기에서 깨진 사례가 있다 (arXiv:2504.02420). 0.25 = 80ms 에 -1 -> +1. 미지정이면 제한 없음(기존 동작)")
     p.add_argument("--pp-k-v", type=float, default=None,
                    help="pure pursuit lookahead 속도계수 (기본 1.2). "
                         "L = clip(k_v * v_cruise, l_min, l_max)")
@@ -96,6 +98,10 @@ def main():
             if not np.isfinite(v) or v <= 0:
                 p.error(f"--{flag.replace('_', '-')} 는 양의 유한한 값이어야 합니다")
             over[key] = float(v)
+    if a.d_rate_max is not None:
+        if not np.isfinite(a.d_rate_max) or not 0 < a.d_rate_max <= 2.0:
+            p.error("--d-rate-max 는 0 초과 2.0 이하여야 합니다 (액션 범위가 [-1,1])")
+        over["d_rate_max"] = float(a.d_rate_max)
     base_cfg = RoverCfg()
     l_min = over.get("pp_l_min", base_cfg.pp_l_min)
     l_max = over.get("pp_l_max", base_cfg.pp_l_max)

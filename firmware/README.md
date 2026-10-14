@@ -19,6 +19,7 @@ firmware/
 ├─ common/                    MCU 비의존 순수 C. 호스트 gcc 테스트 + 시뮬이 ctypes 로 같은 코드 호출
 │   swerve_kinematics.c         역기구학 + 가동범위 안 등가해 선택 (swerve_fold_to_range)
 │   drive_align_gate.c          큰 조향 전환 중 구동 보류
+│   wheel_pi.c                  바퀴 속도 FF + 기준 모델 PI (WPI ON 일 때 구동 duty)
 │   spi_link.c                  Pi <-> Nucleo SPI 144바이트 프레임 (CRC16)
 │   mdd3a_driver.c              m/s -> 정규화 duty
 │   sts3215_protocol.c          (시뮬 전용) 서보 패킷
@@ -31,7 +32,7 @@ firmware/
     Core/Src/motor.c/encoder.c  MDD3A PWM 8채널, 엔코더 타이머 4개
     Core/Src/pi_spi.c           SPI2 슬레이브 (Pi 링크, DMA)
     Core/Src/imu_ism330.c       ISM330DHCX (SPI3 마스터)
-    Core/Src/{swerve_kinematics,drive_align_gate,spi_link,mdd3a_driver}.c
+    Core/Src/{swerve_kinematics,drive_align_gate,spi_link,mdd3a_driver,wheel_pi}.c
                                 -> ../../../common/ 심볼릭 링크
 ```
 
@@ -77,7 +78,8 @@ SPI2 명령 프레임   ─┴─> 목표 (vx, vy, ω) 만 갱신
   5. swerve_fold_to_range      -> 바퀴별 가동범위 안의 등가각 (θ 또는 θ±180° + 역회전)
   6. 조향 SYNC_WRITE           -> 모듈 순서를 서보 순서로 재배열
   7. drive_align_gate          -> 큰 조향 전환 중이면 구동 0
-  8. 구동 PWM                  -> MOTOR_DRIVE_SIGN 적용
+  8. 구동 PWM                  -> WPI ON: wheel_pi_step (목표 바퀴 속도 vs 1 의 엔코더 속도)
+                                  WPI OFF: duty = v/0.378×799 (개루프).  MOTOR_DRIVE_SIGN 적용
   9. 텔레메트리 프레임          -> 다음 SPI 전송에 실림
 ```
 
@@ -99,18 +101,18 @@ SPI2 명령 프레임   ─┴─> 목표 (vx, vy, ω) 만 갱신
 | 조향 영점 | 서보 EEPROM (`ZERO`) | 미기록 | **임시** — 조립 후 |
 | 영점 위치값 | `joint.c` `.offset` | 2048 (`ZERO` 가 현재 자세를 2048 로 기록) | 확정 |
 | 조향 방향 | `joint.c` `.dir` | 전부 +1 | **임시** — `T 30` 이 위에서 반시계면 +1. 뒤쪽 서보(LB, RB)는 앞쪽과 **월드 z축 기준 180°** 돌려 장착(둘 다 아래를 봄) → 회전 방향은 같으므로 네 서보 `dir` 부호는 같아야 함. 영점 차이는 `ZERO ALL` 이 흡수 |
-| 가동범위 | `joint.c` `.min_deg/.max_deg` | 전부 -100° ~ +100° | **임시** — 조립 후 실측. 폭 ≥ 180° 유지 |
-| 시뮬 가동범위 | `sim/rl/config.py` `steer_lo_deg/steer_hi_deg` | 전부 ±100° (순서 FL, FR, RL, RR) | 펌웨어와 **같이** 고칠 것 |
+| 가동범위 | `joint.c` `.min_deg/.max_deg` | 전부 -90° ~ +90° (URDF 관절 한계와 같게, 2026-10-11) | 조립 후 실측. 폭 ≥ 180° 유지 |
+| 시뮬 가동범위 | `sim/rl/config.py` `steer_lo_deg/steer_hi_deg`, Isaac `contract.STEER_LIMIT_RAD` | 전부 ±90° (순서 FL, FR, RL, RR) | 펌웨어와 **같이** 고칠 것 |
 | 조향 0° 의 뜻 | — | 바퀴 정면, 구동모터 몸체 안쪽, + 는 위에서 반시계 | 확정 (시뮬과 동일) |
 | 서보 최고속 | `joint.c` `joint_goal_speed` | 0 = 서보 최대 (제한 없음). 터미널 `S` 로 변경 | 단위 step/s, 4096 step = 360° |
 | 서보 가속도 | `joint.c` `joint_init()` | 50 | 가정 (단위 미실측) |
 | 서보 수신 타임아웃 | `sts3215.c` `STS_RX_TIMEOUT_MS` | 3 ms | 확정 |
 | 서보 읽기 실패 재시도 | `main.c` `SERVO_RETRY_TICKS` | 25 주기 (0.5 s), 한 주기에 1개만 재시도 | 확정 |
 
-±100° 에서 모든 방향이 나온다: 한 방향의 해는 θ(정회전)와 θ±180°(역회전) 두 개이고
-가동 폭이 200° 라 항상 하나는 범위 안이다. ±80°~±100° 는 두 해가 겹쳐 경계 근처
-흔들림에 반전이 생기지 않는다. 경계를 넘으면 180° 반전이 일어나고 그동안 구동은
-정렬 게이트가 멈춘다.
+±90° 에서 모든 방향이 나온다: 한 방향의 해는 θ(정회전)와 θ±180°(역회전) 두 개이고
+가동 폭이 정확히 180° 라 항상 하나는 범위 안이다. 다만 두 해가 겹치는 구간이 없어서
+(예전 ±100° 때는 ±80°~±100° 가 겹쳐 히스테리시스가 있었다) 바퀴 방향이 ±90° 를
+넘나들면(순수 옆걸음 근처) 180° 반전이 일어나고, 그동안 구동은 정렬 게이트가 멈춘다.
 
 ### 4.2 구동과 엔코더
 
@@ -122,8 +124,8 @@ SPI2 명령 프레임   ─┴─> 목표 (vx, vy, ω) 만 갱신
 | 엔코더 부호 | `main.c` `ENCODER_SIGN[MOTOR1..4]` | −1, −1, +1, +1 | MOTOR1 이 duty + 에서 tick + (실측) → 구동 부호와 같음. `V 0.05 0 0` 에서 m/s 가 넷 다 + 인지 확인 |
 | 기어비 | `main.c` `GEAR_RATIO` | 131 (SPG30E-GR131) | 확정 |
 | 엔코더 PPR | `main.c` `ENCODER_PPR` | 16 (x4 → 64, 바퀴 1회전 8384 틱) | **확정 2026-10-03** (무부하 77.8 rpm) |
-| 바퀴 반경 | `main.c` `WHEEL_RADIUS_M` | 0.03995 m (지름 79.9 mm, STL) | 가정 (캘리퍼 미실측) |
-| 바퀴 최고속 | `main.c` `SWERVE_MAX_WHEEL_MPS` | 0.318 m/s (= duty 100%) | 가정. 실측 무부하 0.325 m/s (+2%) |
+| 바퀴 반경 | `main.c` `WHEEL_RADIUS_M` | 0.047503 m (URDF rover_wheel_rev4) | 2026-10-12 URDF·Isaac 과 맞춤 (옛 0.03995 는 rev_2, 19% 작았음) |
+| 바퀴 최고속 | `main.c` `SWERVE_MAX_WHEEL_MPS` | 0.378 m/s (= duty 100%, 7.96 rad/s × 반경) | 시뮬과 일치시킨 가정. 실측 무부하 77.8 rpm → 0.387 m/s (+2%). D1 로 확정 |
 | 모듈 위치 | `main.c` `SWERVE_MODULES` | (±0.105, ±0.1325) m (조향축 = 바퀴 중심) | **실측 2026-10-03**. 시뮬 `axle_x=0.105`, `track=0.265` 와 동일 |
 
 조립 전 날것 방향 기록 (`MOT`, 부호 보정 없음, 샤프트 끝에서 볼 때):
@@ -252,7 +254,7 @@ Z1 → Z2 → Z3 순서대로. 같은 목록이 옵시디언 `실기 확인 목�
 ```bash
 # 공용 C (호스트)
 cd ~/ksrc/firmware/common/tests
-for t in swerve_kinematics drive_align_gate spi_link mdd3a_driver; do
+for t in swerve_kinematics drive_align_gate spi_link mdd3a_driver wheel_pi; do
   gcc -std=c99 -Wall -Wextra -I.. -o /tmp/t_$t test_$t.c ../$t.c -lm && /tmp/t_$t | tail -1
 done
 

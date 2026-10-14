@@ -66,6 +66,7 @@ class RoverEnv(gym.Env):
 
     def __init__(self, cfg: RoverCfg = None, rew: RewardCfg = None,
                  difficulty: float = 0.0, episode_s: float = 20.0,
+                 difficulty_min_frac: float = 0.6,
                  randomize: bool = True, arena_eval: bool = False,
                  eval_kind: str = "sand", privileged: bool = False,
                  noise: NoiseCfg = None, seed: int = None,
@@ -74,7 +75,29 @@ class RoverEnv(gym.Env):
                  drive_align_gate_deg: float = 10.0,
                  soil_amp: float = None,
                  task: str = "path",
-                 discount_gamma: float = 0.998):
+                 action_mode: str = "body",
+                 velocity_obs: bool = False,
+                 history_frames: int = HISTORY,
+                 push_force_max: float = 0.0,
+                 # 시각 전용 메시(CAD STL 13개).  **기본은 끈다** -- 켜면 워커당
+                 # RSS 56MB -> 512MB 라 16워커에서 8.0GB(가용 11GB)를 먹고
+                 # SubprocVecEnv 워커가 죽는다.  뷰어(view.py)만 켠다.
+                 # 끄면 남는 geom 은 전부 group=3 / alpha=0.2 인 충돌체이고
+                 # MuJoCo 뷰어는 group 3 을 기본으로 **안 그리므로** 로버가
+                 # 화면에서 사라진다 (바닥만 보인다).
+                 visual: bool = False,
+                 # reset 마다 MjModel/MjData 를 **새로 만들지** 여부.
+                 # 기본 True = 에피소드마다 로버 파라미터를 다시 뽑는다
+                 # (도메인 랜덤화).  뷰어는 False 로 둬야 한다 -- passive
+                 # viewer 는 처음 넘긴 MjData 객체를 계속 들고 있어서, 재생성
+                 # 하면 화면의 로버가 **영원히 얼어붙는다** (env 는 새 d 를
+                 # 돌리는데 뷰어는 옛 d 를 그린다).  지형·잡음·흙은 어차피
+                 # self.m / self.d 에 **제자리로** 다시 쓰므로 False 여도
+                 # 에피소드마다 바뀐다.  고정되는 건 cfg 샘플 하나뿐이다.
+                 rebuild_on_reset: bool = True,
+                 cmd_filter_tau: float = 0.28,
+                 discount_gamma: float = 0.998,
+                 vel_rew: VelRewardCfg = None):
         self.base_cfg = cfg or RoverCfg()
         self.rew = rew or RewardCfg()
         # "path"  : pure pursuit 를 따라가는 경로추종 (align/prog/gate 보상)
@@ -83,12 +106,49 @@ class RoverEnv(gym.Env):
         if task not in ("path", "cmdvel"):
             raise ValueError("task 는 'path' 또는 'cmdvel' 이어야 합니다")
         self.task = task
-        self.vel_rew = VelRewardCfg()
-        # cmd_vel 스케줄: 2초마다 새 목표를 뽑고 0.3초 1차 필터로 수렴시킨다.
+        # "body"      : [dvx, dvy, domega]              (3D, 기존)
+        # "wheel"     : [dv_1..4]                        (4D, 트랙션 컨트롤만)
+        # "body+wheel": [dvx, dvy, domega, dv_1..4]      (7D)
+        # 바퀴별이 필요한 이유는 config.d_wheel_frac 주석 참고.
+        # 액션 공간 3계열을 Isaac 과 공유한다 (sim2sim 계약).
+        #   body / wheel / body+wheel : 기존 차체·바퀴속도 잔차
+        #   res8   : IK 출력 8개(조향4+속도4)에 각각 잔차 (residual 8D)
+        #   direct8: IK 를 쓰지 않고 조향4+속도4 를 정책이 직접 (pure 8D)
+        _MODES = ("body", "wheel", "body+wheel", "res8", "direct8")
+        if action_mode not in _MODES:
+            raise ValueError(f"action_mode 는 {_MODES} 중 하나여야 합니다")
+        self.action_mode = action_mode
+        self.n_body_act = 3 if action_mode in ("body", "body+wheel") else 0
+        self.n_wheel_act = 4 if action_mode in ("wheel", "body+wheel") else 0
+        # res8/direct8 은 조향4+속도4 를 별도 블록으로 둔다 (잔차 또는 직접).
+        self.n_steer_act = 4 if action_mode in ("res8", "direct8") else 0
+        self.n_wspd_act  = 4 if action_mode in ("res8", "direct8") else 0
+        # 진단 전용: MuJoCo 참 차체속도를 정책에 넣어 속도 관측 부족의 상한을 잰다.
+        # 실기에는 독립적인 대지속도 추정기 검증 전까지 켜서는 안 된다.
+        self.velocity_obs = bool(velocity_obs)
+        if not isinstance(history_frames, int) or not 1 <= history_frames <= HISTORY:
+            raise ValueError(f"history_frames 는 1..{HISTORY} 정수여야 합니다")
+        self.history_frames = history_frames
+        if not np.isfinite(push_force_max) or push_force_max < 0:
+            raise ValueError("push_force_max 는 0 이상의 유한한 힘 [N] 이어야 합니다")
+        self.push_force_max = float(push_force_max)
+        self.visual = bool(visual)
+        self.rebuild_on_reset = bool(rebuild_on_reset)
+        self.push_body = None
+        self.push_force = np.zeros(2)
+        self.push_start = float("inf")
+        self.push_end = float("inf")
+        self.vel_rew = vel_rew or VelRewardCfg()
+        # cmd_vel 스케줄: 2초마다 새 목표를 뽑고 1차 필터로 수렴시킨다.
         # 계단 명령을 그대로 주면 오차의 대부분이 플랜트 지연(잔차로 못 고침)이
         # 되어 학습 신호가 흐려진다.
+        # ROS mujoco_bridge.filter_cmd 와 같은 alpha=dt/(tau+dt) 식이다.
+        # 기본 tau=0.28 은 구 코드 alpha=1/(0.3*50) 와 정확히 같다.
+        if not np.isfinite(cmd_filter_tau) or cmd_filter_tau < 0:
+            raise ValueError("cmd_filter_tau 는 0 이상의 유한한 초 단위 값이어야 합니다")
+        self.cmd_filter_tau = float(cmd_filter_tau)
         self.cmd_hold = int(2.0 * CTRL_HZ)
-        self.cmd_a = 1.0 / (0.3 * CTRL_HZ)
+        self.cmd_a = (1.0 / CTRL_HZ) / (self.cmd_filter_tau + 1.0 / CTRL_HZ)
         self.cmd_tgt = np.zeros(3)
         self.cmd_cur = np.zeros(3)
         self._cmd_k = 0
@@ -97,6 +157,10 @@ class RoverEnv(gym.Env):
             raise ValueError("discount_gamma 는 (0, 1] 범위여야 합니다")
         self.discount_gamma = float(discount_gamma)
         self.difficulty = difficulty
+        if (not np.isfinite(difficulty_min_frac) or
+                not 0 <= difficulty_min_frac <= 1):
+            raise ValueError("difficulty_min_frac 는 [0,1] 범위여야 합니다")
+        self.difficulty_min_frac = float(difficulty_min_frac)
         self.randomize = randomize
         # 모래 비대칭 장(soil_field)은 **이 RL 의 과제 본체**다 (terrain.soil_field
         # docstring 참고).  그런데 `--stage1` 은 randomize 를 통째로 끄면서 이것까지
@@ -118,12 +182,23 @@ class RoverEnv(gym.Env):
         # 구동·센싱 노이즈. randomize=False 면 끈다 (검증 스크립트용).
         self.nz = noise or NoiseCfg()
         self.rng = np.random.default_rng(seed)
+        # 외력은 별도 난수열이다. 스트레스 시험을 켠 것만으로 명령·흙·노이즈
+        # 샘플까지 바뀌면 같은 시드 비교에서 외력 효과를 분리할 수 없다.
+        self.push_rng = np.random.default_rng(
+            np.random.SeedSequence([int(seed), 0x4B535243]) if seed is not None else None)
         self.episode_steps = int(episode_s * CTRL_HZ)
 
-        n_obs = OBS_PER_FRAME * HISTORY + (PRIV_DIM if privileged else 0)
+        # 36D 기본 프레임에는 직전 3D 행동이 포함된다. 바퀴 잔차 모드에서는
+        # 직전 행동이 4D/7D 이므로 프레임과 관측 공간도 함께 늘어야 한다.
+        self.obs_per_frame = (OBS_PER_FRAME - 3 + self.n_body_act +
+                              self.n_wheel_act + self.n_steer_act +
+                              self.n_wspd_act + 3 * self.velocity_obs)
+        n_obs = self.obs_per_frame * self.history_frames + (PRIV_DIM if privileged else 0)
         self.observation_space = spaces.Box(-np.inf, np.inf, (n_obs,), np.float32)
         # 3D 차체 잔차 [Delta_vx, Delta_vy, Delta_omega].  config 주석 참고.
-        self.action_space = spaces.Box(-1.0, 1.0, (3,), np.float32)
+        self.action_space = spaces.Box(
+            -1.0, 1.0, (self.n_body_act + self.n_wheel_act +
+                         self.n_steer_act + self.n_wspd_act,), np.float32)
         # 고정 경로 세트 (Stage 1).  None 이면 에피소드마다 새로 생성 (Stage 2).
         # 학습용과 평가용은 **반드시 다른 seed 로 만든 세트**여야 한다.
         self.path_set = paths
@@ -152,7 +227,8 @@ class RoverEnv(gym.Env):
         self.cfg = sample(self.base_cfg, self.rng) if self.randomize else self.base_cfg
         c = self.cfg
         xml = build(c, terrain="hfield", hfield_n=terr.HF_N,
-                    hfield_size=(terr.ARENA_X / 2, terr.ARENA_Y / 2))
+                    hfield_size=(terr.ARENA_X / 2, terr.ARENA_Y / 2),
+                    visual=self.visual)
         self.m = mujoco.MjModel.from_xml_string(xml)
         self.d = mujoco.MjData(self.m)
         self.n_sub = int(round((1.0 / CTRL_HZ) / self.m.opt.timestep))
@@ -167,6 +243,7 @@ class RoverEnv(gym.Env):
                     for n in ("s_quat", "s_gyro", "s_acc")}
         self.sadr = {k: self.m.sensor_adr[v] for k, v in self.sid.items()}
         self.ground_gid = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_GEOM, "ground")
+        self.push_body = mujoco.mj_name2id(self.m, mujoco.mjtObj.mjOBJ_BODY, "chassis")
 
         # 펌웨어 C 에 넘길 모듈 좌표 (C 순서)
         self.c_modules = kc._make_modules(half_w=c.track / 2, half_l=c.axle_x)
@@ -336,6 +413,9 @@ class RoverEnv(gym.Env):
         v_err = float(np.linalg.norm(tw[:2] - cmd[:2])) / max(self.v_max, 1e-9)
         om_err = abs(float(tw[2] - cmd[2])) / max(self.om_max, 1e-9)
         self.vel_err_hist.append((v_err, om_err))
+        # 복구 지표는 힘이 작용하는 0.3초를 빼고, 힘이 끝난 뒤 1초만 센다.
+        if self.push_force_max > 0 and self.push_end < self.k / CTRL_HZ <= self.push_end + 1.0:
+            self.push_err_hist.append((v_err, om_err))
         return velocity_terms(v_err, om_err, a, self.a_prev, self.a_prev2,
                               self.vel_rew)
 
@@ -394,6 +474,47 @@ class RoverEnv(gym.Env):
         load = float(np.mean(np.abs(duty)))
         return float(np.clip(self.volt * (1.0 - self.nz.volt_sag_k * load), 0.3, 1.0))
 
+
+    def _wheel_speed_meas(self):
+        """제어기가 보는 바퀴속도 [m/s].  **펌웨어가 엔코더로 읽는 것과 같다.**
+
+        _frame() 의 관측용 계산과 같은 양자화·잡음을 쓴다 (실기에서 제어기와
+        관측이 같은 엔코더를 본다).  단 호출마다 난수를 소비하므로 폐루프가
+        켜졌을 때만 부른다 -- 개루프 경로의 시드 재현성을 지키기 위해서다.
+        """
+        c = self.cfg
+        v = np.array([self.d.qvel[j] for j in self.j_wh]) * c.wheel_r
+        if self.randomize:
+            n, r = self.nz, self.rng
+            tick = 2 * np.pi / c.ticks_per_rev * CTRL_HZ * c.wheel_r
+            if n.enc_quant > 0:
+                v = np.round(v / (tick * n.enc_quant)) * tick * n.enc_quant
+            v = v * (1.0 + r.normal(0, n.enc_noise, 4))
+        return v
+
+    def _wheel_duty(self, v_ref):
+        """바퀴속도 기준 -> duty.  전향보상 + PI (config.wheel_closed_loop 주석).
+
+        kp=ki=0 이면 기존 개루프 du = v_ref/v_max 와 **정확히** 같다.
+        """
+        c = self.cfg
+        ff = v_ref / self.v_max
+        if not c.wheel_closed_loop:
+            return np.clip(ff, -1.0, 1.0)
+        e = (v_ref - self._wheel_speed_meas()) / self.v_max
+        # 적분: 누설 + 상한.  포화 중에는 같은 방향으로 더 쌓지 않는다.
+        leak = np.exp(-1.0 / (CTRL_HZ * max(c.wheel_pi_tau_i, 1e-6)))
+        cand = leak * self.wheel_pi_i + e / CTRL_HZ
+        raw = ff + c.wheel_pi_kp * e + c.wheel_pi_ki * cand
+        sat = np.abs(raw) > 1.0
+        self.wheel_pi_i = np.where(sat & (np.sign(e) == np.sign(raw)),
+                                   self.wheel_pi_i, cand)
+        lim = c.wheel_pi_i_max / max(c.wheel_pi_ki, 1e-9)
+        self.wheel_pi_i = np.clip(self.wheel_pi_i, -lim, lim)
+        du = ff + c.wheel_pi_kp * e + c.wheel_pi_ki * self.wheel_pi_i
+        self.wheel_v_err += float(np.mean(np.abs(e)))
+        return np.clip(du, -1.0, 1.0)
+
     # ------------------------------------------------------------------ 관측
     def _frame(self):
         c = self.cfg
@@ -418,6 +539,11 @@ class RoverEnv(gym.Env):
             roll += float(r.normal(0, n.rp_noise)); pitch += float(r.normal(0, n.rp_noise))
             gyro = gyro + self.gyro_b + r.normal(0, n.gyro_noise, 3)
             acc = acc + self.acc_b + r.normal(0, n.acc_noise, 3)
+        # 고전 피드백 기준선이 **정책과 똑같은 센서값**을 쓸 수 있게 남긴다.
+        # 이게 없으면 비교 대상이 참값을 쓰는 oracle 밖에 안 되고, "고전
+        # 제어기로 충분한가" 라는 질문에 배포 가능한 답을 낼 수 없다.
+        self.gyro_meas = np.asarray(gyro, dtype=float).copy()
+        self.wheel_meas = np.asarray(wheel_meas, dtype=float).copy()
         # 물리 스케일로 정규화 -- 파라미터가 바뀌어도 분포가 안 흔들리게
         # wheel_ref_applied 는 **직전 제어주기에 실제 저수준으로 들어간** 값이다
         # (요청값이 아니라 지연 후 값).  그래야 v_ref(t-1) -> v_meas(t) 라는
@@ -434,7 +560,9 @@ class RoverEnv(gym.Env):
             [np.cos(self.e_psi_est), np.sin(self.e_psi_est)],  # 측위 추정 기수오차
             np.clip(self.target_b, -2.0, 2.0),           # 제어기 선행 목표점 (차체좌표)
             [self.target_L],                             # 경로상 선행 거리 (m)
-            self.a_prev,                                   # 직전 행동 3D
+            self.a_prev,                   # 직전 행동 (3/4/7D, action_mode 에 따라)
+            *( [self.body_twist() / np.array([self.v_max, self.v_max, self.om_max])]
+               if self.velocity_obs else [] ),
         ]).astype(np.float32)
 
     def _obs(self):
@@ -481,9 +609,12 @@ class RoverEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-        if self.randomize:
+            self.push_rng = np.random.default_rng(
+                np.random.SeedSequence([int(seed), 0x4B535243]))
+        if self.randomize and (self.rebuild_on_reset or not hasattr(self, "m")):
             self._build()
-        # 난이도를 한 점에 고정하지 않고 U(0.6*d_max, d_max) 로 뽑는다.
+        # 난이도를 기본 U(0.6*d_max, d_max) 로 뽑는다. 평가에서는 하한을
+        # 올려 최상위 난도만 따로 시험할 수 있다.
         # 고정하면 정책이 그 난이도에만 맞춰지고, 커리큘럼이 정체하면 어려운
         # 지형을 영영 못 본다.  범위로 주면 항상 일부는 어렵다.
         # arena_eval 이어도 흙 난이도는 **학습과 같은 분포**에서 뽑는다.
@@ -491,7 +622,8 @@ class RoverEnv(gym.Env):
         # 고정되어 지형 기하의 차이와 흙의 차이가 뒤섞인다 (실제로 실제 경기장
         # 평가에서 세 변형이 전부 무너져 비교가 불가능했다).
         # arena_eval 에서 d_ep 는 흙에만 영향을 준다 -- 지형은 항상 실제 STL.
-        self.d_ep = float(self.rng.uniform(0.6 * self.difficulty, self.difficulty))
+        self.d_ep = float(self.rng.uniform(
+            self.difficulty_min_frac * self.difficulty, self.difficulty))
         # 흙도 난이도에 연동한다. firm -> sand 로 보간되므로 고난이도 에피소드는
         # 실제로 모래가 된다 (예전 거부 샘플링은 모래만 골라서 버렸다).
         self.terr_p = (sample_terrain(self.rng, self.d_ep)
@@ -506,7 +638,12 @@ class RoverEnv(gym.Env):
         # 스폰 높이에 이 오프셋을 반드시 더해야 한다 (안 더하면 지형에 파묻힌다).
         # hfield 의 물리 범위는 학습(8x8)과 평가(실제 4x5)가 다르다. 런타임에 맞춘다.
         ex, ey = terr.eval_extent(self.eval_kind)
-        hx, hy = ((ex / 2, ey / 2) if self.arena_eval
+        # 높이맵의 격자 간격과 물리 크기는 반드시 일치해야 한다.  이전에는
+        # cmdvel 평가에서 3.2x4.0m 규사맵을 8x8m 로 늘렸는데 경사각과
+        # 스폰/경로 좌표가 모두 달라졌다. 학습은 8x8m 절차 규사지형을 쓰고,
+        # arena_eval 은 원본 크기 그대로 별도 검증한다.
+        use_arena = self.arena_eval
+        hx, hy = ((ex / 2, ey / 2) if use_arena
                   else (terr.ARENA_X / 2, terr.ARENA_Y / 2))
         self.m.hfield_size[0, 0] = hx; self.m.hfield_size[0, 1] = hy
         z_off = terr.to_hfield(self.m, Z)
@@ -535,6 +672,19 @@ class RoverEnv(gym.Env):
                 self.spawn_max_slope_deg, clearance) & self.route_drive
             if not spawn_drive.any():
                 raise RuntimeError("평탄한 스폰 후보가 없습니다: 지형 또는 경사 상한을 확인하세요")
+        if self.task == "cmdvel" and not self.arena_eval:
+            # 이 과제는 경로가 아닌 랜덤 차체속도를 추종한다. 지형 가장자리에서
+            # 시작하면 잘못된 속도추종과 무관하게 8초 안에 경계를 벗어난다.
+            # 8x8m 절차지형의 중앙에서 출발시켜 모든 방향의 명령에 공간을 준다.
+            ny, nx = spawn_drive.shape
+            xs = ((np.arange(nx) + 0.5) / nx - 0.5) * self.hf_ex
+            ys = ((np.arange(ny) + 0.5) / ny - 0.5) * self.hf_ey
+            for half_width in (0.9, 1.5):
+                central = spawn_drive & (np.abs(xs)[None, :] <= half_width) & \
+                          (np.abs(ys)[:, None] <= half_width)
+                if central.any():
+                    spawn_drive = central
+                    break
         if self.path_set:
             # 경로 위 s0 에서 시작한다.  경로를 먼저 고르고 그 지점으로 스폰.
             self._pending_generated = None
@@ -588,14 +738,18 @@ class RoverEnv(gym.Env):
         # 근처에서 시작할 때 제어기 기준으로 이미 틀어진 자세가 된다.
         # 실기에서도 nav2 는 rotation_shim_controller 로 큰 초기 요 오차를 먼저
         # 없앤 뒤 경로추종에 들어가므로 +-30도 로 좁힌다.
-        yaw0 = pth.course_at(self.path, self.s0, self.pp_L) + float(
-            self.rng.uniform(-np.pi / 6, np.pi / 6))
+        yaw0 = (float(self.rng.uniform(-np.pi, np.pi)) if self.task == "cmdvel" else
+                pth.course_at(self.path, self.s0, self.pp_L) + float(
+                    self.rng.uniform(-np.pi / 6, np.pi / 6)))
         self.d.qpos[3:7] = [np.cos(yaw0 / 2), 0.0, 0.0, np.sin(yaw0 / 2)]
         self.wp_b = np.zeros((2, 2))
         self.cmd = np.zeros(3)
         self.duty_ik = np.zeros(4)
-        self.a_prev = np.zeros(3)         # 3D 차체 잔차
-        self.a_prev2 = np.zeros(3)
+        # 액션 차원은 action_mode 에 따라 3 / 4 / 7 이다 (보상의 2차 차분에 쓴다)
+        n_act = (self.n_body_act + self.n_wheel_act +
+                 self.n_steer_act + self.n_wspd_act)
+        self.a_prev = np.zeros(n_act)
+        self.a_prev2 = np.zeros(n_act)
         self.st_prev = np.array([self.d.qpos[j] for j in self.j_st])
         self.st_cmd = self.st_prev.copy()        # 서보 1차 지연 상태
         self.th_last = self.st_prev.copy()       # 등가각 선택의 기준 (직전 명령각)
@@ -616,13 +770,28 @@ class RoverEnv(gym.Env):
                                     "v_err", "om_err")}
         self.n_duty_sat = 0.0; self.duty_lost = 0.0; self.duty_use = 0.0
         self.n_drive_gated = 0.0
+        self.steer_err = 0.0
+        self.wheel_pi_i = np.zeros(4)
+        self.wheel_v_err = 0.0
         self.n_steer_sat = 0.0; self.steer_use = 0.0
         # 3D 잔차 진단: 명령 포화율 / 바퀴 desaturation 율 / 권한 사용률
         self.n_cmd_sat = 0.0; self.n_wheel_desat = 0.0
         self.a_use = 0.0; self.a_p95 = []
+        self.wheel_use = 0.0
         self._cmd_k = 0
         self.cmd_tgt = np.zeros(3); self.cmd_cur = np.zeros(3)
+        if self.push_force_max > 0:
+            direction = float(self.push_rng.uniform(-np.pi, np.pi))
+            magnitude = float(self.push_rng.uniform(0.5, 1.0) * self.push_force_max)
+            self.push_force = magnitude * np.array([np.cos(direction), np.sin(direction)])
+            latest = max(0.0, self.episode_steps / CTRL_HZ - 1.3)
+            self.push_start = float(self.push_rng.uniform(min(0.5, latest), latest))
+            self.push_end = self.push_start + 0.3
+        else:
+            self.push_force[:] = 0.0
+            self.push_start = self.push_end = float("inf")
         self.vel_err_hist = []
+        self.push_err_hist = []
         self.wheel_ref_applied = np.zeros(4)
         self.drive_alignment_pending = False
         self.cmd_nom = np.zeros(3)
@@ -662,7 +831,11 @@ class RoverEnv(gym.Env):
         # 리셋 직후에는 아직 바퀴 명령을 인가하지 않았다. 첫 관측에 nominal
         # 속도를 넣으면 게이트가 실제로 막고 있는 동안 관측값이 거짓이 된다.
         self.wheel_ref_applied = np.zeros(4)
-        self.hist = [self._frame() for _ in range(HISTORY)]
+        # 리셋 시 물리 시간이 흐르지 않는다. 같은 정착 상태의 센서값을 한 번만
+        # 읽어 패딩해야 이력이 가짜 독립 노이즈 표본으로 채워지지 않고, 이력 길이를
+        # 바꿔도 이후 환경 난수열이 바뀌지 않는다.
+        first_frame = self._frame()
+        self.hist = [first_frame.copy() for _ in range(self.history_frames)]
         return self._obs(), {}
 
     # ------------------------------------------------------------------ 스텝
@@ -683,13 +856,29 @@ class RoverEnv(gym.Env):
         """
         a = np.clip(np.asarray(a, np.float64), -1, 1)
         c = self.cfg
+        # **변화율 제한.**  크기 상한만으로는 정책이 한 스텝에 -1 -> +1 로
+        # 튀는 것을 못 막는다.  실기에서 그게 깨진 사례가 arXiv:2504.02420
+        # 이다 (config.d_rate_max 주석).  관측에 들어가는 a_prev 와 보상에
+        # 쓰는 a 가 **실제로 적용된 값**이 되도록 자른 뒤에 쓴다.
+        if c.d_rate_max is not None:
+            r = float(c.d_rate_max)
+            a = np.clip(a, self.a_prev - r, self.a_prev + r)
         self.route_dist_prev = self.path.distance(self.d.qpos[:2])
 
         # 1) **차체 수준 잔차**를 nominal 명령에 더한다.
         #    cmd_nom 은 pure pursuit 이 낸 것이고 보상·판정의 기준이다.
         #    cmd_applied 는 정책이 수정한 것이고 IK 로만 들어간다.
+        # res8/direct8 은 조향4+속도4 블록만 쓴다 (차체·바퀴변조 잔차 없음).
+        a_steer8 = a_wspd8 = None
+        if self.n_steer_act:
+            a_steer8 = a[:4]; a_wspd8 = a[4:8]
+            a_body = a[:0]; a_wheel = a[:0]
+        else:
+            a_body = a[:self.n_body_act]
+            a_wheel = a[self.n_body_act:]
         lim = np.array([c.d_vx_max, c.d_vy_max, c.d_om_max])
-        cmd_app = self.cmd_nom + a * lim
+        cmd_app = (self.cmd_nom + a_body * lim if self.n_body_act
+                   else self.cmd_nom.copy())
         # 실현 가능하도록 **공통 비율** 스케일.  바퀴별로 따로 자르면 body twist
         # 모양이 깨진다 (원래 요청한 vx:vy:omega 비율이 바뀐다).
         need = max(np.hypot(cmd_app[0] - cmd_app[2] * mm.y,
@@ -701,9 +890,37 @@ class RoverEnv(gym.Env):
         self.a_use += float(np.mean(np.abs(a)))           # 잔차 권한 사용률
         self.a_p95.append(float(np.max(np.abs(a))))
 
-        # 2) IK -> 바퀴 조향각 / 속도 기준
+        # 2) IK -> 바퀴 조향각 / 속도 기준.
+        #    direct8 은 IK 를 쓰지 않지만, cmd_nom(보상 기준)과 IK 출력을
+        #    관측·베이스 비교용으로 계속 계산해 둔다 (정책 입력엔 안 들어감).
         th_ik, v_ref = self._ik_of(cmd_app)
-        du = np.clip(v_ref / self.v_max, -1.0, 1.0)       # 개루프 duty (Stage 1)
+        if self.action_mode == "direct8":
+            # **pure 8D**: 정책이 조향각·바퀴속도를 직접 명령한다.
+            #   조향 = a_steer8 * steer_hi (전체 가동범위)
+            #   속도 = a_wspd8 * v_max
+            th_ik = a_steer8 * self.st_hi_mj
+            v_ref = a_wspd8 * self.v_max
+            self.steer_use += float(np.mean(np.abs(a_steer8)))
+        elif self.action_mode == "res8":
+            # **residual 8D**: IK 출력에 잔차를 더한다 (a=0 이면 순수 IK).
+            th_ik = th_ik + a_steer8 * c.d_steer_rad
+            v_ref = v_ref * (1.0 + a_wspd8 * c.d_wheel_frac)
+            self.steer_use += float(np.mean(np.abs(a_steer8)))
+        # 2b) **바퀴별 잔차** (트랙션 컨트롤).  IK 출력에 비율로 곱한다.
+        #     조향각은 건드리지 않는다 -- 조향은 위치제어로 이미 잘 따라가고,
+        #     오차의 원인은 구동 슬립이다.
+        #     c.d_wheel_cut_only 면 cut = max(0, a_i) 로 접어 |v_ref_i| 가
+        #     커질 수 없게 한다.  기본은 양방향이다 -- 합 0 투영을 쓰는
+        #     train_wheel_residual.py 와 "공통 증속이 가장 큰 레버" 라는
+        #     사후 최선 측정 때문이다 (config.d_wheel_frac 주석 참고).
+        if self.n_wheel_act:
+            if c.d_wheel_cut_only:
+                mod = -np.maximum(a_wheel, 0.0)
+            else:
+                mod = a_wheel
+            v_ref = v_ref * (1.0 + mod * c.d_wheel_frac)
+            self.wheel_use += float(np.mean(np.abs(mod)))
+        du = self._wheel_duty(v_ref)        # 개루프 or 속도 PI (config 참고)
         self.n_wheel_desat += float(np.any(np.abs(v_ref) > self.v_max * 1.001))
         th = np.clip(th_ik, self.st_lo_mj, self.st_hi_mj)
 
@@ -734,6 +951,13 @@ class RoverEnv(gym.Env):
         max_dth = c.steer_vmax / CTRL_HZ
         th_a = self.st_applied + np.clip(th_a - self.st_applied, -max_dth, max_dth)
         self.st_applied = th_a.copy()
+        # **조향 정렬 오차.**  실기에서 조향 엔코더로 바로 재는 값이고,
+        # 펌웨어의 drive_align_gate 가 이미 같은 양을 쓴다.  "지금이 조향
+        # 재정렬 중인가" 를 시계 없이 판정할 수 있는 유일한 배포 가능 신호다
+        # (cmdvel 시뮬은 명령 전환 시점을 알지만 실기 Nav2 명령은 연속이라
+        # '명령이 바뀐 뒤 몇 초' 라는 게 정의되지 않는다).
+        self.steer_err = float(np.max(np.abs(
+            th_goal - np.array([self.d.qpos[j] for j in self.j_st]))))
         if self.drive_alignment_pending:
             # 큰 방향 전환 중 한 바퀴만 먼저 구동하면 의도하지 않은 yaw 가
             # 생긴다. 지연된 목표각에 네 바퀴가 모두 들어올 때까지 보류한다.
@@ -756,6 +980,8 @@ class RoverEnv(gym.Env):
         # 2) 물리
         for _ in range(self.n_sub):
             self.tm.apply(self.d, self.m.opt.timestep)
+            if self.push_start <= self.k / CTRL_HZ < self.push_end:
+                self.d.xfrc_applied[self.push_body, :2] += self.push_force
             mujoco.mj_step(self.m, self.d)
         self.k += 1
 
@@ -845,7 +1071,8 @@ class RoverEnv(gym.Env):
 
         if self.task == "cmdvel":
             # 경로 항을 **전부 버리고** 속도추종으로 교체한다.
-            #   보상 = -(w_v*||v_xy 오차|| + w_om*|omega 오차|) / 정규화  - 행동벌점
+            #   보상 = w_v*exp(-(e_v/sigma_v)^2)
+            #        + w_om*exp(-(e_om/sigma_om)^2) - 행동벌점
             # 경로·lookahead·align/prog/gate 가 보상에서 사라지므로, pure
             # pursuit 튜닝(lookahead)과 경로 생성기 기하(꺾임각 분포)가 더 이상
             # 결과를 교란하지 않는다.
@@ -895,10 +1122,11 @@ class RoverEnv(gym.Env):
         if len(self.prog_hist) > 2 * CTRL_HZ:                  # 최근 2초
             stuck = (self.prog_hist[-1] - self.prog_hist[-2 * CTRL_HZ]) < 0.02 and slip > 0.5
         # 벽이 물리적으로 막으므로 이건 안전망일 뿐 (벽을 넘었거나 떨어진 경우)
-        ex, ey = terr.eval_extent(self.eval_kind)
-        hx, hy = ((ex / 2, ey / 2) if self.arena_eval
-                  else (terr.ARENA_X / 2, terr.ARENA_Y / 2))
-        oob = bool(abs(self.d.qpos[0]) > hx - 0.1 or abs(self.d.qpos[1]) > hy - 0.1
+        # hfield 물리 범위와 **같은 기준**을 쓴다 (reset 의 use_arena 참고).
+        # 예전엔 여기서 eval_extent 를 다시 읽어서, cmdvel 처럼 물리 범위를
+        # 넓힌 경우 판정 범위가 안 맞았다.
+        oob = bool(abs(self.d.qpos[0]) > self.hf_ex / 2 - 0.1
+                   or abs(self.d.qpos[1]) > self.hf_ey / 2 - 0.1
                    or self.d.qpos[2] < -0.5)
         # 종료/시간만료의 다음 상태 잠재값은 0. 이 보정이 없으면 목표 도착 시점에
         # 남은 경로 실거리에 따라 shaping 총점이 달라지고 조기 종료를 악용할 수 있다.
@@ -964,11 +1192,15 @@ class RoverEnv(gym.Env):
                     drive_gate=self.n_drive_gated / k,
                     # 3D 잔차 진단.  계속 제한에 박혀 있으면 action bound 가 부족하다는 증거
                     cmd_sat=self.n_cmd_sat / k, wheel_desat=self.n_wheel_desat / k,
-                    a_use=self.a_use / k,
+                    a_use=self.a_use / k, wheel_use=self.wheel_use / k,
                     a_p95=float(np.percentile(self.a_p95, 95)) if self.a_p95 else 0.0,
                     t_elapsed=float(self.k / CTRL_HZ),
                     steer_sat=self.n_steer_sat / k, steer_use=self.steer_use / k,
                     tip=tip, stuck=stuck, oob=oob,
+                    push_v_err_m=(float(np.mean([x[0] for x in self.push_err_hist]))
+                                  if self.push_err_hist else float("nan")),
+                    push_om_err_m=(float(np.mean([x[1] for x in self.push_err_hist]))
+                                   if self.push_err_hist else float("nan")),
                     # 에피소드 전 구간 집계 (평균 / 90분위 / 최대)
                     **{f"{k}_{st}": float(f(v)) for k, v in self.acc.items()
                        if v for st, f in (("m", np.mean),

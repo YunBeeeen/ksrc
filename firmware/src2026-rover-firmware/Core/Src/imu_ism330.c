@@ -12,6 +12,7 @@
 #define REG_CTRL1_XL   0x10
 #define REG_CTRL2_G    0x11
 #define REG_CTRL3_C    0x12
+#define REG_STATUS     0x1E   /* bit0 XLDA, bit1 GDA: 새 가속도/자이로 샘플 있음 */
 #define REG_OUTX_L_G   0x22   /* 0x22..0x27 자이로 XYZ, 0x28..0x2D 가속도 XYZ */
 
 #define WHO_AM_I_VALUE 0x6B
@@ -26,6 +27,10 @@
 #define SPI_TIMEOUT    2000U  /* 바이트당 폴링 한계 (1MHz 에서 1바이트 = 8us) */
 
 static uint8_t s_valid = 0;
+
+/* 제어주기 평균 (Imu_Poll 이 쌓고 Imu_TakeMean 이 꺼낸다) */
+static int32_t s_sum[6];
+static uint8_t s_n = 0;
 
 static inline void cs_low(void)  { GPIOC->BSRR = (uint32_t)GPIO_PIN_9 << 16; }
 static inline void cs_high(void) { GPIOC->BSRR = GPIO_PIN_9; }
@@ -172,5 +177,35 @@ int Imu_Check(void)
     {
         s_valid = (uint8_t)configure();
     }
+    return s_valid;
+}
+
+int Imu_Poll(int16_t sample[6])
+{
+    uint8_t st;
+    int16_t v[6];
+    if (!s_valid || !reg_read(REG_STATUS, &st, 1) || (st & 0x03) != 0x03) return 0;
+    if (!Imu_Read(v)) return 0;
+    if (s_n == 255) return 0;
+    for (int i = 0; i < 6; i++) s_sum[i] += v[i];
+    s_n++;
+    if (sample != NULL) memcpy(sample, v, sizeof v);
+    return 1;
+}
+
+int Imu_TakeMean(int16_t out[6], uint8_t *n)
+{
+    *n = s_n;
+    if (s_n == 0)
+    {
+        return Imu_Read(out);          /* 이번 주기에 못 쌓았으면 순간값 하나 */
+    }
+    for (int i = 0; i < 6; i++)
+    {
+        int32_t q = s_sum[i];
+        out[i] = (int16_t)((q >= 0 ? q + s_n / 2 : q - s_n / 2) / s_n);   /* 반올림 */
+        s_sum[i] = 0;
+    }
+    s_n = 0;
     return s_valid;
 }

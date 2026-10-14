@@ -66,6 +66,68 @@ python3 compare_policy.py --model runs/s5_reward/ppo_400000_steps.zip \
   --vecnorm runs/s5_reward/ppo_vecnormalize_400000_steps.pkl --episodes 30
 ```
 
+### 밑단 목표 속도 추종 (`cmdvel`, 2026-10-06)
+
+이 과제는 경로 진행·헤딩 보상을 쓰지 않고, `(vx, vy, ω)` 명령과 **실제 차체속도**의
+오차를 보상한다. 학습은 8×8m 절차 규사지형에서 하며 `--terrain sand`를 줘도
+원본 대회 높이맵을 늘려 쓰지 않는다. 대회맵은 `--eval-geometry arena`로 별도
+평가한다. `cmdvel`의 기본 난이도는 0.8로 고정한다. 경로 완주율로 난이도를
+올리는 콜백은 이 과제에서 사용하지 않는다.
+
+```bash
+cd ~/ksrc/sim/rl
+python3 train.py --task cmdvel --action-mode body --terrain sand \
+  --steps 1000000 --envs 16 --randomize --log-std-init -2.0 \
+  --episode-s 8 --out runs/cmdvel_body_01
+python3 compare_policy.py --task cmdvel --action-mode body --terrain sand \
+  --model runs/cmdvel_body_01/final.zip \
+  --vecnorm runs/cmdvel_body_01/vecnorm.pkl \
+  --episodes 100 --episode-s 8 --difficulty 0.8 --randomize
+```
+
+`--action-mode wheel`은 IK 바퀴속도에 바퀴별 ±30% 잔차를, `body+wheel`은
+차체 3D와 바퀴 4D를 함께 준다. 두 모드의 관측은 각각 1850/2000차원이고,
+현재 펌웨어 SPI 명령과 ROS 정책 브리지는 **3D 차체 명령만** 받으므로 바퀴
+모드는 연구용이다. `--velocity-obs`는 시뮬 **참 차체속도** 3D를 관측에 더해
+속도 센서가 있을 때의 상한을 재는 진단용이다. 실기에 연결하려면 독립적인
+대지속도 추정기와 지연·오차 검증이 먼저 필요하다.
+
+`--history-frames`는 기본 50(1초)이다. 5프레임 참속도 진단 모델은 다음처럼
+학습·평가한다. 짧은 이력과 참속도는 실기 정책 설정이 아니다.
+
+```bash
+python3 train.py --task cmdvel --terrain sand --velocity-obs \
+  --history-frames 5 --steps 200000 --envs 8 --randomize \
+  --episode-s 8 --checkpoint-every 50000 --out runs/cmdvel_truth_probe
+python3 compare_policy.py --task cmdvel --terrain sand --velocity-obs \
+  --history-frames 5 --randomize --difficulty 0.8 --episode-s 8 \
+  --episodes 60 --seed0 6000 \
+  --model runs/cmdvel_truth_probe/final.zip \
+  --vecnorm runs/cmdvel_truth_probe/vecnorm.pkl
+```
+
+참속도 비례 보정의 상한은 `compare_policy.py`에 `--oracle-gain 0.3`을 더해
+같은 시드에서 측정한다. `behavior_clone_cmdvel.py --gain 0.3 --rounds 3`은
+정책이 방문한 상태를 다시 모아 모방한다. 이것은 오라클 진단이며 강화학습
+결과나 실기 속도 센서가 아니다. `--push-force 1.0`은 매 에피소드 0.3초
+평면 외력을 추가하고, 외력 후 1초의 오차를 별도로 출력한다.
+`compare_policy.py --assist-cap 0.25`는 평가 때 보조 행동을 제한하고,
+`--oracle-ki 0.1 --oracle-i-tau 1.0`은 참속도 비례 제어기에 누설 누적
+보정을 더하는 진단 옵션이다. 둘 다 현재 시험에서는 p90 또는 외력 복구를
+개선하지 못했다. `train.py --w-tail 0.1`은 속도 오차의 이차 비용을
+추가하는 실험 옵션(기본 0)이다. 모방 정책에서 PPO를 이어 학습할 때는
+`--resume-lr`, `--resume-target-kl`, `--reset-optimizer-on-resume`,
+`--reset-reward-norm-on-resume`으로 갱신 폭과 보상 통계를 제어할 수 있으나,
+10만 스텝 실험은 학습 전 `s33b`보다 나빴다. 수치와 시드는
+[README](README.md#2026-10-06-밑단-속도추종-과제)에 기록했다.
+
+```bash
+python3 traction_gate.py --terrain loose --slope-deg 10 --speed 0.2 --episodes 12
+```
+
+이 오라클은 시뮬의 참 바퀴 슬립을 읽는다. 바퀴별 제어에 이득이 있는지
+학습 전에 검사하는 용도이며 실기 정책이 아니다.
+
 완료된 s8을 **추가 200만 스텝** 이어 학습할 때는 모델과 관측 정규화 통계를
 함께 복원한다. 새 디렉터리를 지정해야 기존 s8 결과와 당시 코드가 보존된다.
 

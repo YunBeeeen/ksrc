@@ -9,5 +9,6 @@ gcc -shared -fPIC -O2 -o libksrc_common.so \
     ../firmware/common/teleop_protocol.c \
     ../firmware/common/drive_align_gate.c \
     ../firmware/common/spi_link.c \
+    ../firmware/common/wheel_pi.c \
     -lm
 echo "built sim/libksrc_common.so"

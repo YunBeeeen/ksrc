@@ -107,6 +107,13 @@ def setup(ctx, *args, **kw):
                                    "(90 미만이면 낼 수 없는 방향이 생깁니다)")
             bridge_cmd += ["--steer-limit-deg", steer_limit]
         if use_rl:
+            if not rl_model or not rl_vecnorm:
+                raise RuntimeError(
+                    "rl:=true 에는 rl_model 과 rl_vecnorm 을 명시해야 합니다. "
+                    "검증 완료된 배포 정책이 없어서 기본값을 두지 않습니다 "
+                    "(sim/rl/TEACHER_CMDVEL_REPORT.md 참고). "
+                    "특권 관측 teacher(s51 등)는 실기 센서로 관측을 만들 수 "
+                    "없으므로 그대로 넣으면 안 됩니다.")
             if not os.path.isfile(rl_model) or not os.path.isfile(rl_vecnorm):
                 raise RuntimeError(f"RL 모델 또는 vecnorm 이 없음: {rl_model}, {rl_vecnorm}")
             bridge_cmd += ["--model", rl_model, "--vecnorm", rl_vecnorm,
@@ -177,18 +184,28 @@ def generate_launch_description():
                               description="브리지에서 3D student RL 잔차를 적용"),
         # 2026-10-04: s2 -> s13 @2.0M.  s2 는 조향 +-180도, 옛 보상, 옛 e_psi 기준에서
         # 학습해 현 환경과 맞지 않았다.  s13 @2.0M 은 holdout 100 에피소드 짝비교에서
-        # 순수 IK 를 **유의하게 이긴 유일한 체크포인트**다 (잡음 ON 조건):
-        #   횡오차 21.68 -> 19.80mm (-8.7%),  p90 46.58 -> 42.34mm (-9.1%)
-        #   기수 7.38 -> 7.12도 (-3.5%),      완주율 95% 유지
-        # 다른 시드(seed0=2000)·다른 경로세트(path-seed=7777)에서도 -10.0% / -8.6% 로
-        # 재현된다.  대가: 슬립 +26%, 소요시간 +3.8%, cmd_sat 4.6배.
-        # **잡음 OFF 조건에서는 중립적**이다 (평균 횡오차 +4.9% 비유의, p90 -7.6% 유의).
-        DeclareLaunchArgument("rl_model", default_value=os.path.join(
-            HERE, "..", "sim", "rl", "runs", "s13_resid",
-            "ppo_1999900_steps.zip")),
-        DeclareLaunchArgument("rl_vecnorm", default_value=os.path.join(
-            HERE, "..", "sim", "rl", "runs", "s13_resid",
-            "ppo_vecnormalize_1999900_steps.pkl")),
+        # **기본값 없음 (2026-10-07).**  검증 완료된 배포 정책이 아직 없다.
+        #
+        # 이 자리에는 2026-10-04 까지 `s13_resid` 가 박혀 있었고 "순수 IK 를
+        # 유의하게 이긴 유일한 체크포인트" 라고 적혀 있었다.  그 판정은 철회됐다:
+        #  - s13 의 이득은 잘못 맞춰진 `lookahead` 상수 하나를 때워준 것이었다.
+        #    L 을 0.264 -> 0.20 으로 고치면 횡오차 이득이 -1.88mm -> +0.18mm 로
+        #    사라진다 (7점 100에피소드 스윕).
+        #  - **경사 경로집합에서는 13개 지표 전부 유의하게 악화**하고 완주율이
+        #    6%p 떨어진다.  이전 33개 비교에 경사 조건이 0건이었다.
+        # 기본값으로 두면 `rl:=true` 한 번에 그게 조용히 올라간다.
+        #
+        # 현재 가장 나은 cmdvel 모델 `s51` 도 여기 넣으면 안 된다 -- 223D
+        # **특권 관측**(시뮬 참속도 포함)을 보는 teacher 라서 실기 센서로는
+        # 관측을 만들 수 없다.  실기 배포에는 자기수용감각만 쓰는 student 증류와
+        # 그 student 의 독립 재평가가 먼저다 (sim/rl/TEACHER_CMDVEL_REPORT.md).
+        DeclareLaunchArgument(
+            "rl_model", default_value="",
+            description="RL 잔차 정책 .zip (rl:=true 일 때 필수). "
+                        "검증된 기본값이 없으므로 명시해야 한다"),
+        DeclareLaunchArgument(
+            "rl_vecnorm", default_value="",
+            description="위 정책의 VecNormalize .pkl"),
         DeclareLaunchArgument("rl_scale", default_value="1.0",
                               description="정책 잔차 배율 [0,1]"),
         DeclareLaunchArgument("mech_fold", default_value="false",

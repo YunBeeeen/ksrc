@@ -145,6 +145,29 @@ int main(void)
         expect_near("narrow[0].clamped_hi", out[0].angle_rad, (float)(PI / 4.0), 1e-6f);
     }
 
+    /* 2026-10-14 회귀: 순수 옆방향(vx=0)을 계속 주면 IK 누적각이 90° 를 1 ulp 위아래로 오가는데,
+     * 가동범위 ±90° 접기가 그걸 범위 밖으로 보고 +90/-90 을 매 주기 번갈아 냈다 (게이트가 계속 걸림). */
+    {
+        swerve_module_state_t s[SWERVE_NUM_MODULES] = {0};
+        const float lo[SWERVE_NUM_MODULES] = { (float)(-PI / 2), (float)(-PI / 2), (float)(-PI / 2), (float)(-PI / 2) };
+        const float hi[SWERVE_NUM_MODULES] = { (float)(PI / 2), (float)(PI / 2), (float)(PI / 2), (float)(PI / 2) };
+        int k, flips = 0;
+        float prev = 0.0f;
+        for (k = 0; k < 5; k++) {
+            swerve_ik_compute(0.05f, 0.0f, 0.0f, MODULES, 0.378f, s, out);
+            swerve_fold_to_range(lo, hi, 0.0f, 0.0f, s, out);
+        }
+        for (k = 0; k < 50; k++) {
+            swerve_ik_compute(0.0f, 0.05f, 0.0f, MODULES, 0.378f, s, out);
+            swerve_fold_to_range(lo, hi, 0.0f, 0.0f, s, out);
+            if (k > 0 && fabsf(out[0].angle_rad - prev) > 1.0f) flips++;
+            prev = out[0].angle_rad;
+        }
+        expect_near("sideways_no_toggle.flips", (float)flips, 0.0f, 0.5f);
+        expect_near("sideways_no_toggle.angle", out[0].angle_rad, (float)(PI / 2), 2e-4f);
+        expect_near("sideways_no_toggle.speed", out[0].speed_mps, 0.05f, 1e-6f);
+    }
+
     if (g_fail) {
         printf("\nSOME TESTS FAILED\n");
         return 1;

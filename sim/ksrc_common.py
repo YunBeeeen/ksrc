@@ -166,6 +166,58 @@ class TeleopLink:
             ctypes.c_uint32(self.stale_timeout_ms)))
 
 
+# --- wheel_pi.h (바퀴 속도 FF + 기준 모델 PI, 펌웨어 main.c 와 같은 C) -------
+
+class WheelPiCfg(ctypes.Structure):
+    # wheel_pi.h 의 wheel_pi_cfg_t 와 필드 순서/타입이 정확히 같아야 한다.
+    _fields_ = [(n, ctypes.c_float) for n in
+                ("dt", "k_duty", "f_kin", "kick", "w_still", "w_zero", "kp", "ki", "i_max", "tau_m", "duty_max",
+                 "corr_max", "stall_w", "stall_t", "enc_duty", "enc_w", "enc_t",
+                 "enc_retry_t", "enc_window_t", "enc_trips_max")]
+
+
+class WheelPiState(ctypes.Structure):
+    _fields_ = [("r_m", ctypes.c_float), ("i", ctypes.c_float), ("stall_n", ctypes.c_uint16),
+                ("enc_n", ctypes.c_uint16), ("enc_hold", ctypes.c_uint16), ("enc_win", ctypes.c_uint16),
+                ("enc_trips", ctypes.c_uint8), ("stall", ctypes.c_uint8), ("enc_dir", ctypes.c_uint8)]
+
+
+_lib.wheel_pi_default_cfg.argtypes = [ctypes.POINTER(WheelPiCfg)]
+_lib.wheel_pi_default_cfg.restype = None
+_lib.wheel_pi_reset.argtypes = [ctypes.POINTER(WheelPiState)]
+_lib.wheel_pi_reset.restype = None
+_lib.wheel_pi_clear_fault.argtypes = [ctypes.POINTER(WheelPiState)]
+_lib.wheel_pi_clear_fault.restype = None
+_lib.wheel_pi_step.argtypes = [ctypes.POINTER(WheelPiCfg), ctypes.POINTER(WheelPiState), ctypes.c_float, ctypes.c_float]
+_lib.wheel_pi_step.restype = ctypes.c_int16
+
+
+class WheelPi:
+    """바퀴 하나의 속도 PI.  step(w_ref, w_meas) -> duty (+ = 전진, -799..799).
+
+    펌웨어가 20 ms 마다 부르는 것과 **같은 C 함수**.  cfg 값은 kw 로 덮어쓸 수 있다
+    (예: WheelPi(kp=60)).  Isaac(GPU 배치)은 torch 로 옮긴 판을 이 클래스와 같은 입력열로 비교한다."""
+
+    def __init__(self, **kw):
+        self.cfg = WheelPiCfg()
+        _lib.wheel_pi_default_cfg(ctypes.byref(self.cfg))
+        for k, v in kw.items():
+            if not hasattr(self.cfg, k):
+                raise KeyError(k)
+            setattr(self.cfg, k, v)
+        self.state = WheelPiState()
+
+    def reset(self):
+        _lib.wheel_pi_reset(ctypes.byref(self.state))
+
+    def clear_fault(self):
+        _lib.wheel_pi_clear_fault(ctypes.byref(self.state))
+
+    def step(self, w_ref, w_meas):
+        return int(_lib.wheel_pi_step(ctypes.byref(self.cfg), ctypes.byref(self.state),
+                                      ctypes.c_float(w_ref), ctypes.c_float(w_meas)))
+
+
 # --- 자체 검사: 바인딩이 C 테스트 스위트와 일치하는지 증명 ----------------
 
 def _make_modules(half_w=0.12, half_l=0.12):
@@ -207,6 +259,13 @@ def validate_bindings():
     # 워치독
     assert link.is_stale(now_ms=1000 + len(frame) + 1000) is True
     assert link.is_stale(now_ms=1000 + len(frame) + 10) is False
+
+    # 바퀴 PI: test_wheel_pi.c 의 첫 두 줄과 일치 (첫 주기 333, 움직이는 중 231)
+    pi = WheelPi()
+    assert pi.step(2.0, 0.0) == 333, "wheel_pi first step"
+    pi.reset()
+    assert pi.step(2.0, 0.5) == 231, "wheel_pi moving step"
+    assert pi.step(0.0, 1.0) == 0 and pi.state.i == 0.0, "wheel_pi zero ref"
 
     print("ksrc_common bindings self-check: OK")
 

@@ -16,11 +16,11 @@ from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.monitor import Monitor
 
 import sys; sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from env import RoverEnv
+from env import HISTORY, RoverEnv
 import terrain as terr
 import path as pth
 from config import RoverCfg
-from reward import RewardCfg
+from reward import RewardCfg, VelRewardCfg
 
 
 # gamma 만 CLI 로 받는다.  나머지를 여기 모아둔 이유는 **런 매니페스트에
@@ -74,7 +74,10 @@ def write_manifest(out, args, resume_model, resume_stats):
         "argv": sys.argv,
         "args": {k: (str(v) if isinstance(v, pathlib.Path) else v)
                  for k, v in vars(args).items()},
-        "ppo": dict(PPO_KW, gamma=args.gamma),
+        "ppo": dict(PPO_KW, gamma=args.gamma,
+                    effective_learning_rate=(args.resume_lr if args.resume_lr is not None
+                                             else PPO_KW["learning_rate"]),
+                    target_kl=args.resume_target_kl),
         "rollout_steps": PPO_KW["n_steps"] * args.envs,
         # 롤아웃이 batch_size 로 나눠지지 않으면 SB3 가 마지막 미니배치를 작게
         # 만든다.  s13(envs 14 -> 7168) 이 여기 걸려 있었고 s18(16 -> 8192) 과의
@@ -86,6 +89,7 @@ def write_manifest(out, args, resume_model, resume_stats):
         "resume": {"model": str(resume_model) if resume_model else None,
                    "vecnorm": str(resume_stats) if resume_stats else None},
         "reward_cfg": vars(RewardCfg()),
+        "vel_reward_cfg": vars(VelRewardCfg(w_tail=args.w_tail)),
     }
     (out / "manifest.json").write_text(
         json.dumps(man, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
@@ -133,12 +137,12 @@ def resume_files(target):
     model = path if path.suffix == ".zip" else path.with_suffix(".zip")
     if not model.is_file():
         raise ValueError(f"모델 파일이 없습니다: {model}")
-    if model.name == "final.zip":
+    if model.name in ("final.zip", "model.zip"):
         stats = model.parent / "vecnorm.pkl"
     else:
         match = re.fullmatch(r"ppo_(\d+)_steps\.zip", model.name)
         if not match:
-            raise ValueError("--resume 모델은 final.zip 또는 ppo_N_steps.zip 이어야 합니다")
+            raise ValueError("--resume 모델은 final.zip, model.zip 또는 ppo_N_steps.zip 이어야 합니다")
         stats = model.parent / f"ppo_vecnormalize_{match.group(1)}_steps.pkl"
     if not stats.is_file():
         raise ValueError(f"모델과 짝인 VecNormalize 파일이 없습니다: {stats}")
@@ -148,22 +152,29 @@ def resume_files(target):
 def make_env(rank, args):
     def _f():
         paths = None
-        # cmdvel 은 경로를 명령에 쓰지 않지만, 스폰 위치/지형 샘플링이 경로
-        # 세트를 쓰므로 같은 방식으로 만들어 둔다 (보상에는 안 들어간다).
-        if args.stage1 or args.task == "cmdvel":
+        # cmdvel 은 경로를 명령에 쓰지 않는다. 원본 규사맵 경로를 8x8m
+        # 물리맵의 스폰으로 재사용하면 좌표가 어긋나므로 절차지형에서 생성한다.
+        if args.stage1 and args.task == "path":
             # Stage 1: 경로 세트 고정 + 랜덤화/교란/커리큘럼 OFF.
             # "3D 차체 잔차가 경로추종 자체를 배우나" 만 본다.
             paths = stage1_paths(args.terrain if args.terrain != "proc" else "sand",
                                  args.path_seed, args.n_paths,
                                  min_slope_deg=args.min_slope_deg,
                                  d_ep=args.path_d_ep)
-        env = RoverEnv(difficulty=args.d0,
-                       episode_s=args.episode_s, privileged=args.teacher,
+        _cfg_kw = {}
+        if args.d_rate_max is not None: _cfg_kw["d_rate_max"] = args.d_rate_max
+        if args.wheel_closed_loop: _cfg_kw["wheel_closed_loop"] = True
+        env = RoverEnv(cfg=(RoverCfg(**_cfg_kw) if _cfg_kw else None),
+                       difficulty=args.d0,
+                       difficulty_min_frac=args.difficulty_min_frac,
+                       vel_rew=VelRewardCfg(w_tail=args.w_tail),
+                       episode_s=args.episode_s,
+                       privileged=args.teacher or args.teacher_direct,
                        seed=args.seed + rank,
                        # 대회맵으로 학습할 때: 거시 구조 고정 + 미세 요철 교란.
                        # 맵 하나에 고정하면 그 한 장의 요철까지 외우는데, 모래는
                        # 대회 당일까지 움직인다 (다른 팀 주행/갈퀴질/습도).
-                       arena_eval=(args.terrain != "proc"),
+                       arena_eval=(args.terrain != "proc" and args.task == "path"),
                        eval_kind=(args.terrain if args.terrain != "proc" else "sand"),
                        perturb=(0.0 if args.terrain == "proc" else args.perturb),
                        paths=paths,
@@ -172,7 +183,11 @@ def make_env(rank, args):
                        randomize=((not args.stage1) if args.randomize is None
                                   else args.randomize),
                        soil_amp=args.soil_amp,
-                       task=args.task)
+                       push_force_max=args.push_force,
+                       cmd_filter_tau=args.cmd_filter_tau,
+                       task=args.task, action_mode=args.action_mode,
+                       velocity_obs=args.velocity_obs,
+                       history_frames=args.history_frames)
         # Monitor 가 있어야 SB3 가 rollout/ep_rew_mean, ep_len_mean 을 찍는다.
         # make_vec_env() 헬퍼는 자동으로 씌워주지만 SubprocVecEnv 를 직접 만들면
         # 안 씌워진다 -- 그래서 터미널에 손실만 나오고 보상이 안 나왔다.
@@ -262,7 +277,7 @@ class MetricsCallback(BaseCallback):
             # 3D 잔차 진단. a_use/a_p95 가 ±1 에 박혀 있으면 정책 출력
             # 포화·학습 불안정·권한 부족을 구분해야 한다. cmd_sat/wheel_desat 은
             # 실현 가능한 차체/바퀴 명령 제한에 걸린 비율이다.
-            "a_use", "a_p95", "cmd_sat", "wheel_desat",
+            "a_use", "a_p95", "wheel_use", "cmd_sat", "wheel_desat",
             # cmdvel 과제의 **본 지표**.  무차원(v_max / om_max 로 나눈 값).
             # 없으면 reward/track_* 에서 역산해야 하는데, 에피소드 합이라
             # Jensen 때문에 평균과 일치하지 않는다.
@@ -326,14 +341,28 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--steps", type=int, default=4_000_000)
     p.add_argument("--envs", type=int, default=os.cpu_count())
-    p.add_argument("--d0", type=float, default=0.0, help="시작 난이도")
+    p.add_argument("--d0", type=float, default=None,
+                   help="시작 난이도. 기본 path=0, cmdvel=0.8 (속도추종은 고정 난이도)")
+    p.add_argument("--difficulty-min-frac", type=float, default=0.6,
+                   help="에피소드 난도 하한 비율; d0=1에서 0.9면 U(0.9,1.0). "
+                        "기본 0.6은 기존 분포 유지")
     p.add_argument("--episode-s", type=float, default=20.0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="runs/ppo")
+    p.add_argument("--checkpoint-every", type=int, default=200_000,
+                   help="모델·VecNormalize 저장 간격 (전체 환경 스텝)")
     p.add_argument("--resume", metavar="RUN_OR_MODEL",
                    help="기존 run 디렉터리 또는 체크포인트 .zip에서 이어 학습")
     p.add_argument("--allow-source-change", action="store_true",
                    help="저장된 reward.py/env.py와 현재 코드가 달라도 이어 학습")
+    p.add_argument("--reset-optimizer-on-resume", action="store_true",
+                   help="모방학습으로 actor 가 바뀐 모델을 이어 학습할 때 Adam 상태 초기화")
+    p.add_argument("--reset-reward-norm-on-resume", action="store_true",
+                   help="보상이 바뀐 재학습에서 과거 VecNormalize 반환 통계를 초기화")
+    p.add_argument("--resume-lr", type=float, default=None,
+                   help="이어 학습 시 PPO 학습률 재설정 (모방 정책 미세조정용)")
+    p.add_argument("--resume-target-kl", type=float, default=None,
+                   help="이어 학습 시 근사 KL 상한; 큰 정책 갱신을 조기 중단")
     p.add_argument("--drive-align-gate-deg", type=float, default=10.0,
                    help="네 조향각 공통 구동 허용 오차 [deg], 0=게이트 끔")
     p.add_argument("--w-energy", type=float, default=None,
@@ -363,7 +392,8 @@ def main():
     p.add_argument("--path-seed", type=int, default=1234, help="학습 경로 세트 seed")
     p.add_argument("--n-paths", type=int, default=10)
     p.add_argument("--terrain", default="proc", choices=["proc", "sand", "rock"],
-                   help="학습 지형. proc=절차생성, sand/rock=대회맵 고정(미세 요철 교란)")
+                   help="path: proc=절차지형, sand/rock=대회맵. cmdvel: 넓은 절차지형에 "
+                        "규사 물리를 적용하고 대회맵은 별도 평가")
     p.add_argument("--perturb", type=float, default=0.020,
                    help="대회맵 학습 시 미세 요철 진폭(표준편차) [m], 난이도에 비례")
     p.add_argument("--task", default="path", choices=("path", "cmdvel"),
@@ -374,18 +404,83 @@ def main():
                         "않는다 (2026-10-05: 경로추종에서 lookahead 를 0.264 -> "
                         "0.20 으로 맞추자 RL 의 횡오차 이득이 -1.88mm -> +0.18mm "
                         "로 소멸했다).")
+    p.add_argument("--action-mode", default="body",
+                   choices=("body", "wheel", "body+wheel", "res8", "direct8"),
+                   help="IK 잔차 3/4/7D, res8=IK+조향·속도 잔차(8D), "
+                        "direct8=IK 없이 조향·속도 직접(8D)")
+    p.add_argument("--wheel-closed-loop", action="store_true",
+                   help="바퀴 속도 폐루프(엔코더 PI) 켬. 안 켜면 개루프 duty")
+    p.add_argument("--velocity-obs", action="store_true",
+                   help="진단 전용: MuJoCo 참 차체속도를 관측에 추가. 실기 배포 금지")
+    p.add_argument("--push-force", type=float, default=0.0,
+                   help="에피소드마다 0.3초간 가하는 무작위 평면 외력 상한 [N]")
+    p.add_argument("--cmd-filter-tau", type=float, default=0.28,
+                   help="cmdvel 목표속도 필터 시정수 [s]; 0.28=기존 학습 동특성, "
+                        "0.10=ROS 브리지 기본값")
+    p.add_argument("--w-tail", type=float, default=0.0,
+                   help="cmdvel 한정: 큰 정규화 속도오차의 이차 비용 계수 (기본 0)")
+    p.add_argument("--history-frames", type=int, default=HISTORY,
+                   help="관측 이력 프레임 수 (1..50, 기본 50=1초)")
+    p.add_argument("--d-rate-max", type=float, default=None,
+                   help="잔차 변화율 제한 [스텝당 |da|]. 속도 액션은 급격한 변화를 요구할 수 있어 실기에서 깨진 사례가 있다 (arXiv:2504.02420). 0.25 = 80ms 에 -1 -> +1. 미지정이면 제한 없음(기존 동작)")
     p.add_argument("--log-std-init", type=float, default=None,
-                   help="정책 초기 log std.  기본 None = SB3 기본값(0 -> std 1.0). "
-                        "cmdvel 에서는 action scale 이 0.08/0.06/0.35 로 커서 "
+                   help="정책 초기 log std. cmdvel 기본 -2.0 (std 0.135), "
+                        "path 기본 SB3 값(0 -> std 1.0). "
+                        "cmdvel 에서는 action scale 이 0.11/0.085/0.45 로 커서 "
                         "std 1.0 이면 초기 오차가 운용점의 3배까지 벌어지고 "
-                        "exp(-(e/sigma)^2) 보상이 평평해진다.  -1.0 (std 0.37) 권장.")
+                        "exp(-(e/sigma)^2) 보상이 평평해진다.")
+    p.add_argument("--resume-log-std", type=float, default=None,
+                   help="이어 학습 시 정책 행동 탐색 log(std) 재설정; "
+                        "행동 모방 초기값을 좁은 분포로 미세 조정할 때 사용")
     p.add_argument("--teacher", action="store_true",
                    help="특권 관측으로 teacher 학습 (이후 distill.py 로 student 증류)")
+    p.add_argument("--teacher-direct", action="store_true",
+                   help="진단 전용: 43D 특권정보를 잠재 압축 없이 정책에 직접 입력")
     args = p.parse_args()
-    if args.steps < 1 or args.envs < 1:
-        p.error("--steps 와 --envs 는 1 이상이어야 합니다")
+    if args.task == "cmdvel" and args.log_std_init is None and not args.resume:
+        args.log_std_init = -2.0
+    if args.d0 is None:
+        # 경로 완주율 기반 커리큘럼은 속도추종 과제에서 정의되지 않는다.
+        # d=0 은 흙 비대칭과 경사가 모두 0 이라 학습할 외란도 사라진다.
+        args.d0 = 0.8 if args.task == "cmdvel" and not args.stage1 else 0.0
+    if not 0.0 <= args.d0 <= 1.0:
+        p.error("--d0 는 [0, 1] 범위여야 합니다")
+    if not np.isfinite(args.difficulty_min_frac) or not 0 <= args.difficulty_min_frac <= 1:
+        p.error("--difficulty-min-frac 은 [0,1] 범위여야 합니다")
+    if args.teacher and (args.action_mode != "body" or args.velocity_obs):
+        p.error("teacher 네트워크는 현재 36D 프레임/3D 차체 행동 전용입니다")
+    if args.teacher_direct and args.teacher:
+        p.error("--teacher 와 --teacher-direct 중 하나만 사용하세요")
+    if args.teacher_direct and args.velocity_obs:
+        p.error("--teacher-direct 에 참속도를 중복 입력할 수 없습니다")
+    if not 1 <= args.history_frames <= HISTORY:
+        p.error(f"--history-frames 는 1..{HISTORY} 이어야 합니다")
+    if not np.isfinite(args.w_tail) or args.w_tail < 0:
+        p.error("--w-tail 은 0 이상의 유한한 값이어야 합니다")
+    if args.task != "cmdvel" and args.w_tail != 0:
+        p.error("--w-tail 은 cmdvel 과제에서만 사용합니다")
+    if args.reset_optimizer_on_resume and not args.resume:
+        p.error("--reset-optimizer-on-resume 은 --resume 과 함께 사용하세요")
+    if args.reset_reward_norm_on_resume and not args.resume:
+        p.error("--reset-reward-norm-on-resume 은 --resume 과 함께 사용하세요")
+    if args.resume_lr is not None and (
+            not args.resume or not np.isfinite(args.resume_lr) or args.resume_lr <= 0):
+        p.error("--resume-lr 은 --resume 과 함께 쓰는 양의 유한한 값이어야 합니다")
+    if args.resume_target_kl is not None and (
+            not args.resume or not np.isfinite(args.resume_target_kl) or
+            args.resume_target_kl <= 0):
+        p.error("--resume-target-kl 은 --resume 과 함께 쓰는 양의 유한한 값이어야 합니다")
+    if args.resume_log_std is not None and (
+            not args.resume or not np.isfinite(args.resume_log_std)):
+        p.error("--resume-log-std 는 --resume 과 함께 쓰는 유한한 값이어야 합니다")
+    if args.steps < 1 or args.envs < 1 or args.checkpoint_every < 1:
+        p.error("--steps, --envs, --checkpoint-every 는 1 이상이어야 합니다")
     if not np.isfinite(args.drive_align_gate_deg) or args.drive_align_gate_deg < 0:
         p.error("--drive-align-gate-deg 는 0 이상의 유한한 숫자여야 합니다")
+    if not np.isfinite(args.push_force) or args.push_force < 0:
+        p.error("--push-force 는 0 이상의 유한한 숫자여야 합니다")
+    if not np.isfinite(args.cmd_filter_tau) or args.cmd_filter_tau < 0:
+        p.error("--cmd-filter-tau 는 0 이상의 유한한 숫자여야 합니다")
     if args.w_energy is not None:
         p.error("--w-energy 는 현재 미지원입니다. 차축 부하 모델 검증 후 활성화하세요")
     if not np.isfinite(args.gamma) or not 0.0 < args.gamma <= 1.0:
@@ -410,7 +505,7 @@ def main():
                     not args.allow_source_change:
                 p.error(f"저장된 {name}와 현재 코드가 다릅니다. 변경된 환경/보상으로 "
                         "계속 학습하려면 --allow-source-change 를 명시하세요")
-        if not args.stage1:
+        if not args.stage1 and args.task != "cmdvel":
             print("[warn] 커리큘럼 상태는 체크포인트에 저장되지 않습니다. "
                   "--d0 로 재개 난이도를 지정해야 합니다.")
         print(f"[resume] model={resume_model}, vecnorm={resume_stats}")
@@ -439,6 +534,10 @@ def main():
         venv = VecNormalize.load(str(resume_stats), raw_venv)
         venv.training = True
         venv.norm_reward = True
+        if args.reset_reward_norm_on_resume:
+            from stable_baselines3.common.running_mean_std import RunningMeanStd
+            venv.ret_rms = RunningMeanStd(shape=())
+            venv.returns[:] = 0.0
     # teacher 는 특권정보를 z 로 압축하는 인코더를 앞에 단다 (nets.TeacherExtractor).
     # student 는 이 z 를 고유수용감각 이력만으로 맞히도록 나중에 증류한다.
     policy_kwargs = {}
@@ -448,7 +547,7 @@ def main():
         policy_kwargs["log_std_init"] = float(args.log_std_init)
     if args.teacher:
         from nets import TeacherExtractor, LATENT_DIM
-        policy_kwargs = dict(features_extractor_class=TeacherExtractor,
+        policy_kwargs.update(features_extractor_class=TeacherExtractor,
                              features_extractor_kwargs=dict(latent_dim=LATENT_DIM))
 
     # MLP 정책은 CPU 가 더 빠르다 (GPU 전송 오버헤드가 연산보다 큼). SB3 도 경고함.
@@ -469,17 +568,31 @@ def main():
     else:
         model = PPO.load(str(resume_model), env=venv, device="cpu", verbose=1,
                          tensorboard_log=tb)
+        if args.resume_lr is not None:
+            from stable_baselines3.common.utils import get_schedule_fn
+            model.learning_rate = args.resume_lr
+            model.lr_schedule = get_schedule_fn(args.resume_lr)
+        if args.resume_target_kl is not None:
+            model.target_kl = args.resume_target_kl
+        if args.reset_optimizer_on_resume:
+            model.policy.optimizer = model.policy.optimizer_class(
+                model.policy.parameters(), lr=model.lr_schedule(1.0),
+                **model.policy.optimizer_kwargs)
+        if args.resume_log_std is not None:
+            with th.no_grad():
+                model.policy.log_std.fill_(args.resume_log_std)
+            print(f"[resume] exploration std={np.exp(args.resume_log_std):.4f}")
         if not np.isclose(model.gamma, args.gamma) or not np.isclose(venv.gamma, args.gamma):
             p.error("저장된 PPO/VecNormalize gamma 와 --gamma 가 다릅니다")
         print(f"[resume] {model.num_timesteps:,} 스텝부터 {args.steps:,} 스텝 추가 학습")
     model.learn(total_timesteps=args.steps, reset_num_timesteps=resume_model is None,
                 callback=[
                     # Stage 1 은 난이도를 고정한다.
-                    *([] if args.stage1 else [CurriculumCallback(d0=args.d0,
+                    *([] if args.stage1 or args.task == "cmdvel" else [CurriculumCallback(d0=args.d0,
                                                                   verbose=1)]),
                     MetricsCallback(),
                     # 체크포인트의 관측 정규화 통계도 함께 저장한다.
-                    CheckpointCallback(save_freq=max(200_000 // args.envs, 1),
+                    CheckpointCallback(save_freq=max(args.checkpoint_every // args.envs, 1),
                                        save_path=str(out), name_prefix="ppo",
                                        save_vecnormalize=True),
                 ])

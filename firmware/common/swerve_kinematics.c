@@ -1,5 +1,7 @@
 /* 스워브 역기구학 구현. 차체 속도 -> 바퀴 4개의 조향각/속도. 규약은 swerve_kinematics.h 참고. */
 #include "swerve_kinematics.h"
+
+#define SWERVE_FOLD_EPS_RAD 1e-4f   /* 0.006 deg: 가동범위 경계 반올림 허용 */
 #include <math.h>
 
 #define SWERVE_PI      3.14159265358979323846f
@@ -124,10 +126,13 @@ void swerve_fold_to_range(const float lo_rad[SWERVE_NUM_MODULES],
         /* 직전 명령각에 가장 가까운 등가각 th + n*PI */
         float n = floorf((ref - th) / SWERVE_PI + 0.5f);
         float folded = th + n * SWERVE_PI;
-        /* 가동범위를 벗어나면 한 칸 되돌린다 (폭 >= PI 면 반드시 안에 든다) */
-        if (folded > hi) {
+        /* 가동범위를 벗어나면 한 칸 되돌린다 (폭 >= PI 면 반드시 안에 든다).
+         * 2026-10-14: 경계를 반올림 수준(SWERVE_FOLD_EPS_RAD)만 넘은 것은 범위 안으로 본다 (아래에서
+         * 경계에 붙임).  순수 옆방향(vx=0)이면 IK 누적각이 90° 를 1 ulp 위아래로 오가서, 예전에는
+         * +90/-90 을 매 주기 번갈아 내고 구동 정렬 게이트가 계속 걸렸다. */
+        if (folded > hi + SWERVE_FOLD_EPS_RAD) {
             n -= 1.0f;
-        } else if (folded < lo) {
+        } else if (folded < lo - SWERVE_FOLD_EPS_RAD) {
             n += 1.0f;
         }
         folded = th + n * SWERVE_PI;

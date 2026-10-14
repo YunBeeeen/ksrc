@@ -241,7 +241,7 @@ STS_Status sts_set_acceleration(uint8_t id, uint8_t acc)
 STS_Status sts_sync_write_position(uint8_t *ids, uint16_t *positions,
                                     uint16_t *speeds, uint8_t count)
 {
-    (void)speeds;
+    (void)speeds;   /* 위치만 보낸다. 속도는 S 명령/joint_init 이 레지스터 0x2E 에 따로 쓴다 */
     uint8_t tx_buf[STS_MAX_PACKET_LEN];
     uint8_t data_per_servo = 2;
     uint8_t start_addr = STS_REG_GOAL_POSITION;

@@ -41,15 +41,17 @@ class TeacherExtractor(BaseFeaturesExtractor):
     """관측 [고유수용감각 | 특권] 을 [고유수용감각 | z] 로 바꾼다."""
 
     def __init__(self, observation_space: spaces.Box, latent_dim: int = LATENT_DIM):
-        super().__init__(observation_space, PROPRIO_DIM + latent_dim)
-        assert observation_space.shape[0] == PROPRIO_DIM + PRIV_DIM, \
-            f"teacher 는 {PROPRIO_DIM + PRIV_DIM} 차원 관측이 필요하다"
+        proprio_dim = observation_space.shape[0] - PRIV_DIM
+        assert proprio_dim > 0, \
+            f"teacher 관측은 고유수용감각 + {PRIV_DIM}D 특권정보여야 한다"
+        super().__init__(observation_space, proprio_dim + latent_dim)
+        self.proprio_dim = proprio_dim
         self.latent_dim = latent_dim
         # tanh 로 z 를 [-1,1] 에 묶는다. student 회귀가 안정된다.
         self.encoder = _mlp([PRIV_DIM, 64, 64, latent_dim], out_act=nn.Tanh)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        proprio, priv = obs[:, :PROPRIO_DIM], obs[:, PROPRIO_DIM:]
+        proprio, priv = obs[:, :self.proprio_dim], obs[:, self.proprio_dim:]
         return torch.cat([proprio, self.encoder(priv)], dim=1)
 
 

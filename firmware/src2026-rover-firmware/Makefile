@@ -27,6 +27,7 @@ Core/Src/swerve_kinematics.c \
 Core/Src/mdd3a_driver.c \
 Core/Src/drive_align_gate.c \
 Core/Src/spi_link.c \
+Core/Src/wheel_pi.c \
 Core/Src/pi_spi.c \
 Core/Src/imu_ism330.c \
 Core/Src/stm32f4xx_it.c \

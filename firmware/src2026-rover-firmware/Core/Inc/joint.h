@@ -112,6 +112,9 @@ float joint_get_angle(int idx);
  */
 void joint_set_speed(uint16_t speed);
 
+/** 지금 설정된 목표 속도 (S 명령 값, 0 = 최대) */
+uint16_t joint_get_speed(void);
+
 /**
  * @brief  모든 서보의 토크 ON/OFF
  * @param  on  1=ON, 0=OFF

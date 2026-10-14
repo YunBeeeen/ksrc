@@ -11,11 +11,11 @@
 | 총질량 | 2.26 kg (규정 3 kg 이하) |
 | 크기 | 284 × 263 × 173 mm (규정 300×300×200 이하) |
 | 휠베이스 / 트랙 | 210 / 265 mm (조향축 = 바퀴 중심, 2026-10-03 실측. 이전 STL 183.6 / 236.7) |
-| 바퀴 | 지름 79.9 mm, 폭 35 mm, 그라우저 약 28개 |
+| 바퀴 | 지름 95.0 mm, 폭 37.2 mm, 그라우저 약 28개 (URDF `rover_description` 충돌 실린더 r=47.503 mm. 이전 79.9 mm 는 구 조립본 rev_2) |
 | 지상고 | 9.6 mm (다리 하우징 최저점 기준) |
 | 구동 | SPG30E-GR131 ×4 (12V, 131:1, 76 rpm 무부하, 20 kg·cm 정지토크) |
-| 조향 | FEETECH STS3215 ×4 (반이중 UART 버스, 1 Mbaud). 가동범위: 바퀴별 ±100° (펌웨어 `joint.c` = 시뮬 `config.steer_*_deg`, 조립 후 실측으로 확정) |
-| 최고 속도 | 0.318 m/s |
+| 조향 | FEETECH STS3215 ×4 (반이중 UART 버스, 1 Mbaud). 가동범위: 바퀴별 ±90° (URDF 관절 한계 = 펌웨어 `joint.c` = 시뮬 `config.steer_*_deg` = Isaac `STEER_LIMIT_RAD`, 조립 후 실측으로 확정) |
+| 최고 속도 | 0.378 m/s (76 rpm × 바퀴 반경 47.5 mm) |
 | 배터리 | 3S 650mAh 120C 리포 |
 | MCU / SBC | STM32 Nucleo-F446RE / Raspberry Pi 5 + AI HAT |
 
