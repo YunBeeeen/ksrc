@@ -12,8 +12,8 @@ Observation = exactly what the Isaac student group computes (rover_env_cfg.py St
   steering       servo position register (telemetry steer_meas_rad)      [rad]
   steering_rate  servo speed register step/s * 2 pi / 4096                [rad/s]
   wheel_rate     encoder 20 ms difference (telemetry wheel_mps / r)       [rad/s]
-  applied_targets  steering goal x4 [rad] + wheel speed target x4 [rad/s] the Nucleo applied
-                   (= IK + residual, wheels 0 while the drive-align gate holds)
+  applied_targets  steering goal x4 [rad] + wheel speed target x4 [rad/s] the Pi just commanded
+                   (= IK + residual, before the Nucleo's command delay and drive gate)
 each term with STUDENT_HISTORY frames, oldest first (Isaac Lab flatten_history_dim); after a
 reset the buffer is filled with the first frame (Isaac Lab CircularBuffer).  The layout comes
 from the exported <policy>.json (sim/isaac/ksrc_rover/scripts/export_student.py).
@@ -132,9 +132,8 @@ class StudentObs:
         return np.concatenate([self.buf[n].reshape(-1) for n, _ in self.layout])[None]
 
 
-def applied_for_obs(ik_goal, ik_speed_mps, tlm):
-    """What the sim's applied_targets holds: goal + wheel target [rad/s], wheels 0 while the gate holds."""
+def applied_for_obs(ik_goal, ik_speed_mps, tlm=None):
+    """What the sim's applied_targets holds (2026-10-14): the targets the policy just commanded -- IK + residual,
+    before the Nucleo's command delay and drive gate.  ``tlm`` is unused (kept for the call sites)."""
     w = np.asarray(ik_speed_mps, np.float32) / np.float32(WHEEL_RADIUS_M)
-    if tlm is not None and tlm["flags"] & nl.TLM_FLAG_GATE_PENDING:
-        w = np.zeros(4, np.float32)
     return np.asarray(ik_goal, np.float32), w

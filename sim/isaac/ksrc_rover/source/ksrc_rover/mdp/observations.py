@@ -16,7 +16,11 @@ def wheel_velocity(env, asset_cfg: SceneEntityCfg):
 
 
 def applied_targets(env):
-    return env.action_manager.get_term("rover").processed_actions
+    """The joint targets the policy just commanded (IK + residual, before the command delay and the drive
+    gate) -- what the Pi knows it sent (pi/policy/student_runtime.py applied_for_obs).  2026-10-14: was the
+    *delayed* target (processed_actions); with a 1-2 step delay the policy then could not see the commands
+    still in flight, and the Pi side meant something else."""
+    return env.action_manager.get_term("rover").commanded_targets
 
 
 # --- Privileged (teacher-only) observations ------------------------------------
