@@ -308,7 +308,19 @@ def t_duty(rec, a):
 def t_log(rec, a):
     """명령 하나를 a.sec 초 보내며 전부 기록 (모래 A/B, 경사 정지 등). 진행 거리는 줄자로 따로."""
     rec.hold(0.5, rec.poll)
-    tl = rec.hold(a.sec, rec.vel, a.vx, a.vy, a.w)
+    tl, prev, t0 = [], 0, time.monotonic()
+    watch = ((F.TLM_FLAG_WHEEL_STALL, "STALL (어느 바퀴가 보정 상한에서 0.5 s 넘게 멈춤 -> FF 만)"),
+             (F.TLM_FLAG_ENC_DIR, "ENC_DIR (엔코더 방향 불일치로 잠김)"), (F.TLM_FLAG_GATE_PENDING, "GATE (정렬 대기)"))
+    for _ in range(max(1, int(round(a.sec / DT)))):
+        t = rec.vel(a.vx, a.vy, a.w)
+        if t is None:
+            continue
+        tl.append(t)
+        for bit, name in watch:      # 걸리고 풀리는 순간을 바로 찍는다
+            if (t["flags"] ^ prev) & bit:
+                print(f"  {time.monotonic() - t0:5.2f}s  {'켜짐' if t['flags'] & bit else '꺼짐'}  {name}  "
+                      f"duty {list(t['duty'])}  바퀴 m/s {[round(x, 3) for x in t['wheel_mps']]}", flush=True)
+        prev = t["flags"]
     rec.stop()
     w = np.array([t["wheel_mps"] for t in tl], float)
     d = np.array([t["duty"] for t in tl], float)
