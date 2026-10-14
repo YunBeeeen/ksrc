@@ -7,6 +7,8 @@
     python3 pi/common/bringup.py gate                 # 4. 구동 정렬 게이트 (띄움)      ~15 s
     python3 pi/common/bringup.py duty --vx 0.15       # 5. 지면 직진: 바퀴끼리 미는지
     python3 pi/common/bringup.py log --vx 0.1 --sec 8 --tag sand_wpi_on   # 6. 모래·경사 기록
+    python3 pi/common/bringup.py wpi --wpi off            # 7. 바퀴 PI 끄기/켜기·corr (SPI, USB 불필요)
+    python3 pi/common/bringup.py sand --vx 0.1 --sec 8    # 8. 모래 A/B (조건 자동 전환, 줄자 입력)
     ... --fake                                        # 노트북: 가짜 Nucleo (fake_nucleo.py)
 
 각 항목은 PASS / 확인 필요 를 찍고, --out 디렉터리(기본 bringup_logs/<시각>_<항목>.npz)에
@@ -331,8 +333,91 @@ def t_log(rec, a):
     return True
 
 
+# ---------------------------------------------------------------- 7. wpi (설정)
+def _set_wpi(rec, on, corr):
+    """SPI 타입 0x03 으로 바퀴 PI 설정 후, 텔레메트리로 적용 확인. (on, corr) 실제값을 돌려준다."""
+    rec.link.config(wpi_on=on, corr=corr)
+    rec.next_t = time.monotonic()        # 앞선 주행으로 밀린 일정 초기화 (안 하면 대기 없이 연달아 읽어 옛 프레임을 봄)
+    for _ in range(5):
+        t = rec.poll()
+    if t is None:
+        return None, None
+    return bool(t["flags"] & F.TLM_FLAG_WHEEL_PI), t["wpi_corr"]
+
+
+def t_wpi(rec, a):
+    """바퀴 PI 를 라파에서 SPI 로 켜고 끄기 (--wpi on|off|keep, --corr N).  USB 없이 됨.  재부팅하면 펌웨어 기본값."""
+    on = {"on": True, "off": False, "keep": None}[a.wpi]
+    got_on, got_corr = _set_wpi(rec, on, a.corr)
+    print(f"  지금 바퀴 PI {'ON' if got_on else 'OFF'}, 보정량 상한 corr {got_corr} duty")
+    ok = verdict(got_on is not None and (on is None or got_on == on) and (a.corr is None or got_corr == round(a.corr)),
+                 "설정이 펌웨어에 들어감 (텔레메트리로 확인)")
+    return ok
+
+
+# ---------------------------------------------------------------- 8. sand (모래 A/B)
+SAND_CONDS = {"off": (False, None), "on": (True, 250.0), "c100": (True, 100.0), "c50": (True, 50.0)}
+
+
+def t_sand(rec, a):
+    """모래 A/B: 조건(--conds off,on,c100)마다 같은 코스를 --vx 로 --sec 초.  조건은 SPI 로 바꾸고(USB 불필요),
+    매 회 출발선 정렬 Enter -> 주행 -> 줄자 거리 입력.  회마다 npz, 끝에 요약 CSV·표.  진행률 = 줄자 ÷ 엔코더 거리."""
+    conds = [c.strip() for c in a.conds.split(",") if c.strip()]
+    for c in conds:
+        if c not in SAND_CONDS:
+            raise SystemExit(f"모르는 조건 {c} (가능: {', '.join(SAND_CONDS)})")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    rows = []
+    order = [(r, c) for r in range(a.sand_reps) for c in conds]
+    for i, (r, c) in enumerate(order):
+        on, corr = SAND_CONDS[c]
+        got_on, got_corr = _set_wpi(rec, on, corr)
+        print(f"\n[{i + 1}/{len(order)}] 조건 {c}: 바퀴 PI {'ON' if got_on else 'OFF'}, corr {got_corr}  (반복 {r + 1})")
+        if not a.no_prompt:
+            input("  로버를 출발선에 맞추고 Enter (주행 시작) ")
+        run = Rec(rec.link)
+        run.hold(0.3, run.vel, 0.0, 0.0, 0.0)
+        tl, fl_all = [], 0
+        for _ in range(max(1, int(round(a.sec / DT)))):
+            t = run.vel(a.vx, a.vy, a.w)
+            if t is not None:
+                tl.append(t)
+                fl_all |= t["flags"]
+        run.stop()
+        w = np.array([t["wheel_mps"] for t in tl], float)
+        d = np.array([t["duty"] for t in tl], float)
+        enc = float((w.sum(0) * DT).mean())
+        tape = None
+        if not a.no_prompt:
+            s = input(f"  엔코더 거리 {enc:.3f} m.  줄자로 잰 실제 이동 거리 [m] (모르면 Enter): ").strip()
+            tape = float(s) if s else None
+        prog = tape / enc if tape and enc > 1e-3 else float("nan")
+        row = dict(i=i, cond=c, rep=r, wpi=int(bool(got_on)), corr=got_corr, enc_m=round(enc, 4),
+                   tape_m=tape if tape is not None else float("nan"), progress=round(prog, 3),
+                   duty_abs=round(float(np.abs(d).mean()), 1), sat=round(float(np.mean(np.abs(d) >= 799)), 4),
+                   stall=int(bool(fl_all & F.TLM_FLAG_WHEEL_STALL)), enc_dir=int(bool(fl_all & F.TLM_FLAG_ENC_DIR)))
+        rows.append(row)
+        print(f"  진행률 {prog:.2f}, |duty| {row['duty_abs']}, 포화 {row['sat']:.1%}, 스톨 {row['stall']}")
+        run.save(os.path.join(a.out, f"{stamp}_sand_{i:02d}_{c}_r{r}{'_' + a.tag if a.tag else ''}.npz"))
+    _set_wpi(rec, True, 250.0)                       # 펌웨어 기본으로 돌려놓음
+    import csv
+    path = os.path.join(a.out, f"{stamp}_sand_summary{'_' + a.tag if a.tag else ''}.csv")
+    with open(path, "w", newline="") as f:
+        wr = csv.DictWriter(f, fieldnames=list(rows[0]))
+        wr.writeheader()
+        wr.writerows(rows)
+    print(f"\n  요약 {path}")
+    print(f"  {'조건':>6} {'회':>3} {'엔코더 m':>9} {'줄자 m':>8} {'진행률':>7} {'|duty|':>7} {'포화':>6} {'스톨':>4}")
+    for c in conds:
+        rr = [x for x in rows if x["cond"] == c]
+        mean = lambda k: np.nanmean([x[k] for x in rr]) if rr else float("nan")
+        print(f"  {c:>6} {len(rr):3d} {mean('enc_m'):9.3f} {mean('tape_m'):8.3f} {mean('progress'):7.2f} "
+              f"{mean('duty_abs'):7.0f} {mean('sat'):6.1%} {sum(x['stall'] for x in rr):4d}")
+    return True
+
+
 TESTS = {"link": t_link, "latency": t_latency, "encdir": t_encdir, "res": t_res, "gate": t_gate,
-         "duty": t_duty, "log": t_log}
+         "duty": t_duty, "log": t_log, "wpi": t_wpi, "sand": t_sand}
 
 
 def main():
@@ -348,6 +433,11 @@ def main():
     ap.add_argument("--tag", default="")
     ap.add_argument("--out", default="bringup_logs")
     ap.add_argument("--enc-sign", type=int, nargs=4, default=(1, 1, 1, 1), help="--fake 에서 엔코더 부호 실수 흉내")
+    ap.add_argument("--wpi", choices=("on", "off", "keep"), default="keep", help="wpi: 바퀴 PI 켜기/끄기")
+    ap.add_argument("--corr", type=float, default=None, help="wpi: 보정량 상한 [duty] (기본 250)")
+    ap.add_argument("--conds", default="off,on,c100", help="sand: 조건 목록 (off, on=corr250, c100, c50)")
+    ap.add_argument("--sand-reps", type=int, default=2, help="sand: 조건마다 반복 횟수")
+    ap.add_argument("--no-prompt", action="store_true", help="sand: 출발선·줄자 입력 없이 (시험용)")
     a = ap.parse_args()
     names = ["link", "latency", "encdir", "res", "gate"] if a.test == "all-lifted" else [a.test]
     results = {}
@@ -363,10 +453,11 @@ def main():
         try:
             results[name] = TESTS[name](rec, a)
         finally:
-            if name not in ("link",):
+            if name not in ("link", "wpi"):
                 rec.stop()
             stamp = time.strftime("%Y%m%d_%H%M%S")
-            rec.save(os.path.join(a.out, f"{stamp}_{name}{'_' + a.tag if a.tag else ''}.npz"))
+            if name not in ("wpi", "sand"):              # sand 는 회마다 따로 저장
+                rec.save(os.path.join(a.out, f"{stamp}_{name}{'_' + a.tag if a.tag else ''}.npz"))
             link.close()
         a.sec = None if a.test == "all-lifted" else a.sec
     print("결과: " + ", ".join(f"{k} {'PASS' if v else '확인 필요'}" for k, v in results.items()))

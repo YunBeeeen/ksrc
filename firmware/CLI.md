@@ -284,9 +284,10 @@ python3 pi/teleop/teleop_joystick.py --udp raspberrypi.local --rate 50 --max-lin
 | 8 | 지면, WPI OFF→ON | `bringup.py duty --vx 0.15` | 바퀴끼리 미는지 (duty 차이·부호), 보호 플래그 |
 | 9 | 지면 주행 | `sysid_uart.py imu --tag bumps` | 실제 진동 → 시뮬 GRAV_ERR |
 | 10 | 경사, duty 0 | `bringup.py log --vx 0 --sec 10 --tag slope_hold` + 바퀴를 손으로 돌려 역구동 | 밀려 내려가는지, 역구동 뻑뻑함 (시뮬 기어 마찰) |
-| 11 | 모래 A/B | `WPI OFF` / `WPI ON` / `WPI SET corr 100` 마다 `bringup.py log --vx 0.1 --sec 8 --tag sand_<조건>` | 줄자 거리 ÷ 엔코더 거리 = 진행률, duty 포화, 스톨 |
+| 11 | 모래 A/B | `bringup.py sand --vx 0.1 --sec 8` (조건 off / on / c100 을 **SPI 로 자동 전환**, 매 회 출발선 Enter → 줄자 거리 입력, 끝에 요약 CSV·표) | 줄자 거리 ÷ 엔코더 거리 = 진행률, duty 포화, 스톨 |
 
 ### RL 정책 주행 (구조 B, 2026-10-13): 펌웨어 IK + 바퀴별 잔차
+SPI 타입 `0x03` (10-14) = 바퀴 PI 설정: ON/OFF, 보정량 상한 corr. 라파에서 `bringup.py wpi --wpi off` / `--wpi on --corr 100` (USB 불필요, 재부팅하면 기본값 ON·250). 텔레메트리 [140] `wpi_corr`.
 SPI 타입 `0x02` = (vx, vy, w) + 조향 잔차 4 [rad] + 바퀴 속도 배율 4. 펌웨어는 **지금과 같은 IK·접기** 뒤에
 조향각 += 잔차 (±30°, 가동범위로 자름), 바퀴 속도 ×= 배율 (0.4–1.6, 최고속으로 자름) 을 하고 게이트·PI 로 간다.
 잔차가 100 ms 넘게 안 오면 순수 IK 로 계속 (속도 워치독 500 ms 는 그대로). 텔레메트리 flags 비트 11 `RES_ACTIVE`.

@@ -31,8 +31,8 @@ bash sim/build.sh          # firmware/common C 를 라파용 .so 로 (bringup·�
 
 | 파일 | 어디서 | 하는 일 |
 |---|---|---|
-| `nucleo_link.py` | (라이브러리) | SPI 프레임 인코딩·텔레메트리 해석 (`SpiLink`: `exchange` 속도 명령, `exchange_res` RL 잔차). 펌웨어 `firmware/common/spi_link.c` 와 바이트 단위로 같음. 모든 SPI 도구가 이걸 씀 |
-| `bringup.py` | 라파 | **실물 점검 묶음**: `link` `encdir` `latency` `res` `gate` `duty` `log`, `all-lifted`. PASS/확인 필요 + `bringup_logs/*.npz`. 순서는 `firmware/CLI.md` "실물 점검·측정 순서" |
+| `nucleo_link.py` | (라이브러리) | SPI 프레임 인코딩·텔레메트리 해석 (`SpiLink`: `exchange` 속도 명령, `exchange_res` RL 잔차, `config` 바퀴 PI 설정). 펌웨어 `firmware/common/spi_link.c` 와 바이트 단위로 같음. 모든 SPI 도구가 이걸 씀 |
+| `bringup.py` | 라파 | **실물 점검 묶음**: `link` `encdir` `latency` `res` `gate` `duty` `log` `wpi`(PI 켜기/끄기·corr, SPI) `sand`(모래 A/B), `all-lifted`. PASS/확인 필요 + `bringup_logs/*.npz`. 순서는 `firmware/CLI.md` "실물 점검·측정 순서" |
 | `fake_nucleo.py` | 노트북 | 가짜 Nucleo (펌웨어 C 그대로). `bringup.py ... --fake` 로 실물 없이 시험 |
 | `spi_monitor.py` | 라파 | 50 Hz 로 주고받으며 텔레메트리를 한 줄씩 (`--vx 0.05` 등으로 명령도) |
 | `spi_timing.py` | 라파 | SPI 교환 주기·왕복 (폴링만) |
@@ -69,8 +69,13 @@ python3 pi/common/bringup.py all-lifted
 # 조이스틱 주행: 라파 / PC
 python3 pi/common/udp_spi_bridge.py
 python3 pi/teleop/teleop_joystick.py --udp raspberrypi.local --rate 50 --max-lin 0.15 --max-ang 0.8 --monitor
-# 모래·경사 기록
-python3 pi/common/bringup.py log --vx 0.1 --sec 8 --tag sand_wpi_on
+# 바퀴 PI 끄기/켜기 (USB 없이)
+python3 pi/common/bringup.py wpi --wpi off
+python3 pi/common/bringup.py wpi --wpi on --corr 250
+# 모래 A/B (조건 자동 전환, 매 회 줄자 입력)
+python3 pi/common/bringup.py sand --vx 0.1 --sec 8 --conds off,on,c100 --sand-reps 2
+# 경사 정지 등 기록
+python3 pi/common/bringup.py log --vx 0 --sec 10 --tag hold12_down
 # RL 정책 (torch 설치 후)
 python3 pi/policy/run_policy.py --policy ~/policies/res8_mlp_h5 --cmd 0.10 0 0 --seconds 5 --log run1.npz
 ```

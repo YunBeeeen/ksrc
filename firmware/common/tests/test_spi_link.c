@@ -5,6 +5,7 @@
 #include "spi_link.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 static int g_fail = 0;
 
@@ -28,7 +29,7 @@ int main(void)
 
     /* 2) 명령 프레임 왕복 + 고정 위치 확인 */
     {
-        spi_link_cmd_t c = { SPI_LINK_TYPE_VEL_CMD, 7, 0.1f, -0.05f, 0.5f, {0}, {0} };
+        spi_link_cmd_t c = { SPI_LINK_TYPE_VEL_CMD, 7, 0.1f, -0.05f, 0.5f, {0}, {0}, 0, 0.0f };
         spi_link_cmd_t d;
         spi_link_pack_cmd(&c, f);
         expect("cmd.sync", f[0] == 0xA5 && f[1] == 0x5A);
@@ -53,7 +54,7 @@ int main(void)
     /* 2b) 잔차 명령 (타입 0x02): 왕복, CRC 위치 [50], 다른 타입은 잔차 0·이득 1 */
     {
         spi_link_cmd_t c = { SPI_LINK_TYPE_VEL_RES, 9, 0.2f, 0.0f, -0.3f,
-                             { 0.1f, -0.2f, 0.0f, 0.5f }, { 1.0f, 1.3f, 0.7f, 1.6f } };
+                             { 0.1f, -0.2f, 0.0f, 0.5f }, { 1.0f, 1.3f, 0.7f, 1.6f }, 0, 0.0f };
         spi_link_cmd_t d;
         spi_link_pack_cmd(&c, f);
         expect("res.parse_ok", spi_link_parse_cmd(f, &d) == SPI_LINK_OK);
@@ -67,11 +68,31 @@ int main(void)
         f[3] = SPI_LINK_TYPE_VEL_CMD;   /* 타입 바이트가 깨져 0x01 로 읽히면 CRC 위치가 달라 걸려야 */
         expect("res.type_flip_rejected", spi_link_parse_cmd(f, &d) != SPI_LINK_OK);
         spi_link_cmd_t v = { SPI_LINK_TYPE_VEL_CMD, 1, 0.1f, 0.0f, 0.0f,
-                             { 9.0f, 9.0f, 9.0f, 9.0f }, { 9.0f, 9.0f, 9.0f, 9.0f } };
+                             { 9.0f, 9.0f, 9.0f, 9.0f }, { 9.0f, 9.0f, 9.0f, 9.0f }, 0, 0.0f };
         spi_link_pack_cmd(&v, f);
         expect("vel_cmd.layout_unchanged", f[20] == 0 && f[34] == 0);
         expect("vel_cmd.parse_gives_no_residual", spi_link_parse_cmd(f, &d) == SPI_LINK_OK &&
                d.d_steer[0] == 0.0f && d.wheel_gain[2] == 1.0f);
+    }
+
+    /* 2c) 설정 (타입 0x03): WPI ON/OFF·보정량 상한, CRC [12], 다른 타입은 KEEP/NaN */
+    {
+        spi_link_cmd_t c, d;
+        memset(&c, 0, sizeof c);
+        c.type = SPI_LINK_TYPE_CONFIG; c.seq = 5; c.wpi_mode = 0; c.wpi_corr = 100.0f;
+        spi_link_pack_cmd(&c, f);
+        expect("cfg.layout", f[3] == 0x03 && f[6] == 0 && f[14] == 0 && (f[12] | f[13]) != 0);
+        expect("cfg.parse_ok", spi_link_parse_cmd(f, &d) == SPI_LINK_OK);
+        expect("cfg.values", d.type == 3 && d.seq == 5 && d.wpi_mode == 0 && d.wpi_corr == 100.0f &&
+                             d.vx == 0.0f && d.wheel_gain[0] == 1.0f);
+        f[8] ^= 0x01;
+        expect("cfg.crc", spi_link_parse_cmd(f, &d) == SPI_LINK_ERR_CRC);
+        c.wpi_mode = SPI_WPI_KEEP; c.wpi_corr = NAN;
+        spi_link_pack_cmd(&c, f);
+        expect("cfg.keep", spi_link_parse_cmd(f, &d) == SPI_LINK_OK && d.wpi_mode == SPI_WPI_KEEP && isnan(d.wpi_corr));
+        spi_link_cmd_t v = { SPI_LINK_TYPE_VEL_CMD, 1, 0.1f, 0.0f, 0.0f, {0}, {0}, 0, 0.0f };
+        spi_link_pack_cmd(&v, f);
+        expect("vel_cmd.no_config", spi_link_parse_cmd(f, &d) == SPI_LINK_OK && d.wpi_mode == SPI_WPI_KEEP && isnan(d.wpi_corr));
     }
 
     /* 3) 텔레메트리 왕복 (음수 틱 / 음수 duty / 음수 imu 부호 보존) */
@@ -93,7 +114,7 @@ int main(void)
         t.steer_speed[0] = -3000; t.steer_load[2] = -1000;
         t.steer_volt[3] = 121; t.steer_temp[0] = 45; t.steer_status[1] = 0x20;
         t.servo_valid = 0x0B;
-        t.imu_n = 4;
+        t.imu_n = 4; t.wpi_corr = 250;
         spi_link_pack_telemetry(&t, f);
         expect("tlm.type", f[3] == SPI_LINK_TYPE_TELEMETRY);
         expect("tlm.parse_ok", spi_link_parse_telemetry(f, &u) == SPI_LINK_OK);

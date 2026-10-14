@@ -671,6 +671,26 @@ static void pi_spi_poll(void)
     }
     teleop_command(c.vx, c.vy, c.omega, 1);
   }
+  if (c.type == SPI_LINK_TYPE_CONFIG)
+  {
+    /* 라파에서 바퀴 PI 설정 (UART `WPI ON/OFF`, `WPI SET corr` 와 같은 효과). 주행 명령 아님 */
+    int changed = 0;
+    if (c.wpi_mode == 0 || c.wpi_mode == 1)
+    {
+      s_wpi_on = c.wpi_mode;
+      changed = 1;
+    }
+    if (isfinite(c.wpi_corr) && c.wpi_corr >= 0.0f && c.wpi_corr <= (float)PWM_MAX)
+    {
+      s_wpi_cfg.corr_max = c.wpi_corr;
+      changed = 1;
+    }
+    if (changed)
+    {
+      for (int m = 0; m < SWERVE_NUM_MODULES; m++) wheel_pi_clear_fault(&s_wpi[m]);
+    }
+    return;
+  }
   if (c.type == SPI_LINK_TYPE_VEL_RES)
   {
     /* 잔차가 하나라도 NaN 이면 잔차만 버린다 (속도 명령은 위에서 이미 받음 -> 순수 IK) */
@@ -2014,6 +2034,7 @@ int main(void)
             (wpi_any(1)         ? SPI_TLM_FLAG_ENC_DIR        : 0u) |
             (s_res_active       ? SPI_TLM_FLAG_RES_ACTIVE     : 0u));
         t.t_ms = now;
+        t.wpi_corr = (uint16_t)(s_wpi_cfg.corr_max + 0.5f);
         t.cmd_vx = s_cmd_applied[0];
         t.cmd_vy = s_cmd_applied[1];
         t.cmd_omega = s_cmd_applied[2];

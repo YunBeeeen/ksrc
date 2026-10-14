@@ -18,7 +18,8 @@ _LIB = ctypes.CDLL(str(Path(__file__).resolve().parents[2] / "sim" / "libksrc_co
 class CCmd(ctypes.Structure):
     _fields_ = [("type", ctypes.c_uint8), ("seq", ctypes.c_uint8),
                 ("vx", ctypes.c_float), ("vy", ctypes.c_float), ("omega", ctypes.c_float),
-                ("d_steer", ctypes.c_float * 4), ("wheel_gain", ctypes.c_float * 4)]
+                ("d_steer", ctypes.c_float * 4), ("wheel_gain", ctypes.c_float * 4),
+                ("wpi_mode", ctypes.c_uint8), ("wpi_corr", ctypes.c_float)]
 
 
 class CTlm(ctypes.Structure):
@@ -32,7 +33,7 @@ class CTlm(ctypes.Structure):
                 ("steer_meas_rad", ctypes.c_float * 4), ("steer_speed", ctypes.c_int16 * 4),
                 ("steer_load", ctypes.c_int16 * 4), ("steer_volt", ctypes.c_uint8 * 4),
                 ("steer_temp", ctypes.c_uint8 * 4), ("steer_status", ctypes.c_uint8 * 4),
-                ("servo_valid", ctypes.c_uint8), ("imu_n", ctypes.c_uint8)]
+                ("servo_valid", ctypes.c_uint8), ("imu_n", ctypes.c_uint8), ("wpi_corr", ctypes.c_uint16)]
 
 
 Frame = ctypes.c_uint8 * nl.SPI_FRAME_LEN
@@ -85,6 +86,26 @@ def test_res_cmd_frame_bytes_match_c():
         assert list(parsed.d_steer) == ds and list(parsed.wheel_gain) == g and parsed.type == 2
 
 
+def test_config_frame_bytes_match_c():
+    import math
+    rng = random.Random(3)
+    for _ in range(300):
+        seq = rng.randrange(256)
+        on = rng.choice((None, True, False))
+        corr = rng.choice((None, f32(rng.uniform(0, 799))))
+        py = nl.encode_spi_config(seq, on, corr)
+        c = CCmd(nl.SPI_TYPE_CONFIG, seq)
+        c.wpi_mode = nl.SPI_WPI_KEEP if on is None else int(on)
+        c.wpi_corr = float("nan") if corr is None else corr
+        out = Frame()
+        _LIB.spi_link_pack_cmd(ctypes.byref(c), out)
+        assert py == bytes(out)
+        p = CCmd()
+        assert _LIB.spi_link_parse_cmd(Frame.from_buffer_copy(py), ctypes.byref(p)) == 0
+        assert p.type == 3 and p.wpi_mode == c.wpi_mode
+        assert (math.isnan(p.wpi_corr) and corr is None) or p.wpi_corr == corr
+
+
 def test_telemetry_from_c_decodes_in_python():
     rng = random.Random(2)
     for _ in range(500):
@@ -109,6 +130,7 @@ def test_telemetry_from_c_decodes_in_python():
             t.steer_status[i] = rng.randrange(256)
         t.servo_valid = rng.randrange(16)
         t.imu_n = rng.randrange(256)
+        t.wpi_corr = rng.randrange(800)
         out = Frame()
         _LIB.spi_link_pack_telemetry(ctypes.byref(t), out)
         d = nl.decode_spi_telemetry(bytes(out))
@@ -129,6 +151,7 @@ def test_telemetry_from_c_decodes_in_python():
         assert d["steer_status"] == tuple(t.steer_status)
         assert d["servo_valid"] == tuple(bool(t.servo_valid >> m & 1) for m in range(4))
         assert d["imu_n"] == t.imu_n
+        assert d["wpi_corr"] == t.wpi_corr
         bad = bytearray(out)
         bad[rng.randrange(2, nl.SPI_FRAME_LEN)] ^= 1 << rng.randrange(8)
         assert nl.decode_spi_telemetry(bytes(bad)) is None
@@ -138,5 +161,6 @@ if __name__ == "__main__":
     test_crc16_matches_c()
     test_cmd_frame_bytes_match_c()
     test_res_cmd_frame_bytes_match_c()
+    test_config_frame_bytes_match_c()
     test_telemetry_from_c_decodes_in_python()
     print("ALL SPI LINK CROSS-CHECKS PASSED")

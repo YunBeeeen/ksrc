@@ -32,7 +32,8 @@ F4 = ctypes.c_float * 4
 class CCmd(ctypes.Structure):
     _fields_ = [("type", ctypes.c_uint8), ("seq", ctypes.c_uint8),
                 ("vx", ctypes.c_float), ("vy", ctypes.c_float), ("omega", ctypes.c_float),
-                ("d_steer", ctypes.c_float * 4), ("wheel_gain", ctypes.c_float * 4)]
+                ("d_steer", ctypes.c_float * 4), ("wheel_gain", ctypes.c_float * 4),
+                ("wpi_mode", ctypes.c_uint8), ("wpi_corr", ctypes.c_float)]
 
 
 class CTlm(ctypes.Structure):
@@ -45,7 +46,7 @@ class CTlm(ctypes.Structure):
                 ("steer_meas_rad", ctypes.c_float * 4), ("steer_speed", ctypes.c_int16 * 4),
                 ("steer_load", ctypes.c_int16 * 4), ("steer_volt", ctypes.c_uint8 * 4),
                 ("steer_temp", ctypes.c_uint8 * 4), ("steer_status", ctypes.c_uint8 * 4),
-                ("servo_valid", ctypes.c_uint8), ("imu_n", ctypes.c_uint8)]
+                ("servo_valid", ctypes.c_uint8), ("imu_n", ctypes.c_uint8), ("wpi_corr", ctypes.c_uint16)]
 
 
 class CGate(ctypes.Structure):
@@ -87,6 +88,7 @@ class FakeSpi:
         self.pos = [0.0] * 4
         self.duty = [0] * 4
         self.flags_extra = 0
+        self.wpi_on, self.corr = True, 250.0     # 10-14 펌웨어 기본 (WPI ON, corr 250)
         self.tlm = bytes(nl.SPI_FRAME_LEN)
         self._advance()
 
@@ -102,7 +104,7 @@ class FakeSpi:
 
     def _tick(self, now):
         timed_out = now - self.last_cmd_ms > 500
-        flags = nl.TLM_FLAG_IMU_VALID | self.flags_extra
+        flags = nl.TLM_FLAG_IMU_VALID | self.flags_extra | (nl.TLM_FLAG_WHEEL_PI if self.wpi_on else 0)
         res_active = False
         if self.teleop:
             flags |= nl.TLM_FLAG_TELEOP_ACTIVE | nl.TLM_FLAG_SRC_SPI
@@ -154,6 +156,7 @@ class FakeSpi:
         t.imu[5] = int(1.0 / nl.IMU_ACC_G_PER_LSB)       # +1 g (칩 z = 로버 z)
         t.rx_err = self.rx_err & 0xFFFF
         t.servo_valid, t.imu_n = 0x0F, 4
+        t.wpi_corr = int(self.corr + 0.5)
         out = Frame()
         _LIB.spi_link_pack_telemetry(ctypes.byref(t), out)
         self.tlm = bytes(out)
@@ -167,6 +170,12 @@ class FakeSpi:
             return reply
         self.seq_echo = c.seq
         now = self._now_ms()
+        if c.type == nl.SPI_TYPE_CONFIG:
+            if c.wpi_mode in (0, 1):
+                self.wpi_on = bool(c.wpi_mode)
+            if math.isfinite(c.wpi_corr) and 0 <= c.wpi_corr <= 799:
+                self.corr = c.wpi_corr
+            return reply
         if c.type in (nl.SPI_TYPE_VEL_CMD, nl.SPI_TYPE_VEL_RES):
             if all(math.isfinite(v) for v in (c.vx, c.vy, c.omega)):
                 self.teleop = True

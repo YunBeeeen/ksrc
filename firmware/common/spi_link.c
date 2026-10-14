@@ -4,6 +4,12 @@
 
 #define CMD_CRC_OFS  18   /* CRC 는 [2]..[17]   (타입 0x00·0x01) */
 #define RES_CRC_OFS  50   /* CRC 는 [2]..[49]   (타입 0x02) */
+#define CFG_CRC_OFS  12   /* CRC 는 [2]..[11]   (타입 0x03) */
+
+static int cmd_crc_ofs(uint8_t type)
+{
+    return type == SPI_LINK_TYPE_VEL_RES ? RES_CRC_OFS : (type == SPI_LINK_TYPE_CONFIG ? CFG_CRC_OFS : CMD_CRC_OFS);
+}
 #define TLM_CRC_OFS  (SPI_LINK_FRAME_LEN - 2)   /* CRC 는 [2]..[141] */
 
 uint16_t spi_link_crc16(const uint8_t *data, uint32_t len)
@@ -79,8 +85,15 @@ void spi_link_pack_cmd(const spi_link_cmd_t *cmd, uint8_t frame[SPI_LINK_FRAME_L
     frame[5] = 0;
     put_f32(&frame[6], cmd->vx);
     put_f32(&frame[10], cmd->vy);
-    put_f32(&frame[14], cmd->omega);
     int ofs = CMD_CRC_OFS;
+    if (cmd->type == SPI_LINK_TYPE_CONFIG) {
+        frame[6] = cmd->wpi_mode;
+        frame[7] = 0;
+        put_f32(&frame[8], cmd->wpi_corr);
+        put_u16(&frame[CFG_CRC_OFS], spi_link_crc16(&frame[2], CFG_CRC_OFS - 2));
+        return;
+    }
+    put_f32(&frame[14], cmd->omega);
     if (cmd->type == SPI_LINK_TYPE_VEL_RES) {
         for (int i = 0; i < 4; i++) {
             put_f32(&frame[18 + 4 * i], cmd->d_steer[i]);
@@ -97,16 +110,31 @@ spi_link_status_t spi_link_parse_cmd(const uint8_t frame[SPI_LINK_FRAME_LEN],
     if (frame[0] != SPI_LINK_SYNC0 || frame[1] != SPI_LINK_SYNC1) return SPI_LINK_ERR_SYNC;
     if (frame[2] != SPI_LINK_VERSION) return SPI_LINK_ERR_VERSION;
     /* 타입 바이트도 CRC 안이라, 깨진 타입으로 고른 CRC 위치는 거의 확실히 CRC 에서 걸린다 */
-    const int ofs = (frame[3] == SPI_LINK_TYPE_VEL_RES) ? RES_CRC_OFS : CMD_CRC_OFS;
+    const int ofs = cmd_crc_ofs(frame[3]);
     if (get_u16(&frame[ofs]) != spi_link_crc16(&frame[2], (uint32_t)ofs - 2)) {
         return SPI_LINK_ERR_CRC;
     }
     if (frame[3] != SPI_LINK_TYPE_POLL && frame[3] != SPI_LINK_TYPE_VEL_CMD &&
-        frame[3] != SPI_LINK_TYPE_VEL_RES) {
+        frame[3] != SPI_LINK_TYPE_VEL_RES && frame[3] != SPI_LINK_TYPE_CONFIG) {
         return SPI_LINK_ERR_TYPE;
     }
     out->type = frame[3];
     out->seq = frame[4];
+    out->wpi_mode = SPI_WPI_KEEP;
+    {
+        uint32_t nan_bits = 0x7FC00000u;
+        memcpy(&out->wpi_corr, &nan_bits, sizeof out->wpi_corr);
+    }
+    if (frame[3] == SPI_LINK_TYPE_CONFIG) {
+        out->wpi_mode = frame[6];
+        out->wpi_corr = get_f32(&frame[8]);
+        out->vx = out->vy = out->omega = 0.0f;
+        for (int i = 0; i < 4; i++) {
+            out->d_steer[i] = 0.0f;
+            out->wheel_gain[i] = 1.0f;
+        }
+        return SPI_LINK_OK;
+    }
     out->vx = get_f32(&frame[6]);
     out->vy = get_f32(&frame[10]);
     out->omega = get_f32(&frame[14]);
@@ -155,6 +183,7 @@ void spi_link_pack_telemetry(const spi_link_telemetry_t *t,
     }
     frame[138] = t->servo_valid;
     frame[139] = t->imu_n;
+    put_u16(&frame[140], t->wpi_corr);
     put_u16(&frame[TLM_CRC_OFS], spi_link_crc16(&frame[2], TLM_CRC_OFS - 2));
 }
 
@@ -195,5 +224,6 @@ spi_link_status_t spi_link_parse_telemetry(const uint8_t frame[SPI_LINK_FRAME_LE
     }
     out->servo_valid = frame[138];
     out->imu_n = frame[139];
+    out->wpi_corr = get_u16(&frame[140]);
     return SPI_LINK_OK;
 }

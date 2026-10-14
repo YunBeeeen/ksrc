@@ -31,6 +31,14 @@
  *   [34] wheel_gain float x4      IK 바퀴 속도에 곱할 값 (1 = 그대로)
  *   [50] CRC16 ([2]..[49])
  *   [52..143] 0
+ *   타입 0x03 (2026-10-14, 설정: 라파에서 바퀴 PI 켜고 끄기 -- 모래 A/B 시험용):
+ *   [6]  wpi_mode u8   0 = OFF (개루프), 1 = ON (PI), 0xFF = 그대로
+ *   [7]  예약 (0)
+ *   [8]  wpi_corr f32  PI 보정량 상한 [duty] (0..799), NaN = 그대로
+ *   [12] CRC16 ([2]..[11])
+ *   주행 명령이 아니다: 워치독을 갱신하지 않고 텔레옵도 시작하지 않는다.  바꾸면 PI 상태·고장 잠금을 비운다
+ *   (UART `WPI ON/OFF`, `WPI SET corr` 와 같은 효과).  적용 결과는 텔레메트리 flags WHEEL_PI 와 [140] wpi_corr.
+ *
  *   펌웨어는 |d_steer| <= SPI_RES_STEER_MAX, wheel_gain 은 SPI_RES_GAIN_MIN..MAX 로 자르고,
  *   잔차가 SPI_RES_TIMEOUT_MS 넘게 안 오면 잔차 없이(순수 IK) 계속 간다.
  *
@@ -62,7 +70,7 @@
  *   [138] servo_valid u8       비트 m = 모듈 m 의 서보 값이 이번 주기에 읽혔다
  *   [139] imu_n u8             imu 값이 이번 주기(20 ms) 동안 읽은 샘플 몇 개의 평균인지 (208 Hz → 보통 3–4).
  *                              0 = 평균 없음, 순간값 하나 (2026-10-13 이전 펌웨어도 0)
- *   [140..141] 예약 (0)
+ *   [140] wpi_corr u16         지금 바퀴 PI 보정량 상한 [duty] (10-14, 타입 0x03 확인용. 이전 펌웨어는 0)
  *   [142] CRC16 ([2]..[141])
  *
  * CRC16 = CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, 반사/xorout 없음).
@@ -86,6 +94,8 @@ extern "C" {
 #define SPI_LINK_TYPE_POLL       0x00
 #define SPI_LINK_TYPE_VEL_CMD    0x01
 #define SPI_LINK_TYPE_VEL_RES    0x02  /* 속도 명령 + 바퀴별 잔차 (RL Res8) */
+#define SPI_LINK_TYPE_CONFIG     0x03  /* 설정 (바퀴 PI ON/OFF, 보정량 상한) */
+#define SPI_WPI_KEEP             0xFFu /* wpi_mode: 그대로 */
 #define SPI_LINK_TYPE_TELEMETRY  0x81
 
 /* 텔레메트리 flags 비트 */
@@ -122,6 +132,8 @@ typedef struct {
     float   vx, vy, omega;
     float   d_steer[4];     /* VEL_RES 만. 그 외 타입은 parse 가 0 으로 */
     float   wheel_gain[4];  /* VEL_RES 만. 그 외 타입은 parse 가 1 로 */
+    uint8_t wpi_mode;       /* CONFIG 만: 0 OFF / 1 ON / SPI_WPI_KEEP.  그 외 타입은 SPI_WPI_KEEP */
+    float   wpi_corr;       /* CONFIG 만: 보정량 상한 [duty], NaN = 그대로.  그 외 타입은 NaN */
 } spi_link_cmd_t;
 
 typedef struct {
@@ -144,6 +156,7 @@ typedef struct {
     uint8_t  steer_status[4];
     uint8_t  servo_valid;
     uint8_t  imu_n;           /* imu 평균에 들어간 샘플 수 (0 = 순간값) */
+    uint16_t wpi_corr;        /* 바퀴 PI 보정량 상한 [duty] */
 } spi_link_telemetry_t;
 
 uint16_t spi_link_crc16(const uint8_t *data, uint32_t len);
