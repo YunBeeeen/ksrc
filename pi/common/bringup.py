@@ -115,8 +115,13 @@ def flags_str(f):
 
 # ---------------------------------------------------------------- 0. link
 def t_link(rec, a):
-    """명령 없이 폴링: CRC 실패, 틱 중복·건너뜀, Nucleo 주기, imu_n, 서보, 플래그."""
-    tl = rec.hold(a.sec, rec.poll)
+    """정지 명령(속도 0) 상태로: CRC 실패, 틱 중복·건너뜀, Nucleo 주기, imu_n, 서보, 플래그.
+    폴링만 하면 텔레옵 전이라 펌웨어 10 Hz UART 로그가 켜져 있어 0.1 s 마다 40 ms 주기가 섞인다
+    (10-14 실측).  속도 0 명령으로 텔레옵에 넘겨 로그를 끄고, 처음 0.5 s 는 버린다."""
+    rec.hold(0.5, rec.vel, 0.0, 0.0, 0.0)
+    n0, bad0 = len(rec.rows), rec.bad
+    tl = rec.hold(a.sec, rec.vel, 0.0, 0.0, 0.0)
+    rec.rows, rec.bad = rec.rows[n0:], rec.bad - bad0
     n = len(rec.rows)
     ticks = [t["tick"] for t in tl]
     tms = [t["t_ms"] for t in tl]
