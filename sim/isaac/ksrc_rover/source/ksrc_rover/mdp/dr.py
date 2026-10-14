@@ -204,6 +204,7 @@ def _sources():
         "steer_vel_servo": _servo_speed_src,
         "wheel_vel_enc": _EncoderSrc,
         "gravity_imu": _GravityImuSrc,
+        "gyro_imu": _GyroImuSrc,
     }
 
 
@@ -306,6 +307,44 @@ class _GravityImuSrc:
                 self.filt.g = torch.where(m.unsqueeze(-1), -acc / 9.81, self.filt.g)
                 self.filt.need_init &= ~m
         return self.filt.g.clone()
+
+
+class _GyroImuSrc:
+    """Student gyro as the rover delivers it (2026-10-14, choice A): the IMU rate averaged over the
+    20 ms control period (firmware Imu_TakeMean), i.e. rotation from the previous to the current root
+    orientation / dt in the body frame -- the same quantity _GravityImuSrc feeds its filter.  Gets the
+    episode gyro bias (DR) and Gaussian noise (params noise_gyro); the Pi subtracts its boot bias, so
+    the remaining bias on the rover is smaller than in training.  Right after a reset: 0 (standing)."""
+
+    def __init__(self, env, params):
+        self.sg = float(params.get("noise_gyro", 0.0))
+        self.dt = float(env.step_dt)
+        self.q_prev = None
+        self.fresh = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        self.out = torch.zeros(env.num_envs, 3, device=env.device)
+
+    def reset(self, env_ids):
+        ids = slice(None) if env_ids is None else env_ids
+        self.fresh[ids] = True
+        self.out[ids] = 0.0
+
+    def __call__(self, env, cfg, advance):
+        if not advance:
+            return self.out.clone()
+        import isaaclab.utils.math as mu
+        q = env.scene["robot"].data.root_quat_w
+        if self.q_prev is None:
+            self.q_prev = q.clone()
+        q_prev = torch.where(self.fresh.unsqueeze(-1), q, self.q_prev)
+        gyro = mu.axis_angle_from_quat(mu.quat_mul(mu.quat_inv(q_prev), q)) / self.dt
+        self.q_prev = q.clone()
+        self.fresh[:] = False
+        if getattr(env, "_gyro_bias", None) is not None:
+            gyro = gyro + env._gyro_bias
+        if self.sg > 0:
+            gyro = gyro + self.sg * torch.randn_like(gyro)
+        self.out = gyro
+        return gyro.clone()
 
 
 class DelayedObs(ManagerTermBase):

@@ -259,6 +259,10 @@ class ObservationsCfg:
         #   gravity  : 20 ms-averaged IMU -> complementary filter (pi/common/sensor_fusion.py), not true gravity
         #   steering : servo position register (shaft side, linkage play not seen), 4096 grid
         #   wheel    : encoder tick difference over 20 ms (1 tick = 0.0375 rad/s), no added noise
+        # gyro: 20 ms 평균 IMU (펌웨어 Imu_TakeMean, 텔레메트리 그대로, Pi 가 부팅 바이어스 뺌). 10-14 선택 A.
+        #   teacher 'policy' 그룹은 참 각속도 순간값 그대로 둠 (teacher 입력 고정).
+        gyro = ObsTerm(func=mdp.DelayedObs, params={
+            "source": "gyro_imu", "noise_gyro": STUDENT_NOISE["imu_gyro"] if DR_STAGE >= 2 else 0.0})
         gravity = ObsTerm(func=mdp.DelayedObs, params={    # filter-input noise only in DR stage 2
             "source": "gravity_imu", "noise_gyro": STUDENT_NOISE["imu_gyro"] if DR_STAGE >= 2 else 0.0,
             "noise_acc": STUDENT_NOISE["imu_acc"] if DR_STAGE >= 2 else 0.0,

@@ -87,6 +87,10 @@ def main():
         raise SystemExit(f"Res8 정책이 아님 (action_dim {meta['action_dim']})")
     pol = torch.jit.load(args.policy + ".pt", map_location="cpu").eval()
     h = torch.zeros(*meta["hidden_shape"]) if meta.get("recurrent") else None
+    with torch.no_grad():                     # 첫 호출은 TorchScript 최적화로 수십 ms -> 루프 전에 한 번
+        x0 = torch.zeros(1, int(meta["obs_dim"]))
+        for _ in range(3):
+            pol(x0) if h is None else pol(x0, h)
     dt = float(meta.get("control_dt_s", 0.02))
     obs_b = StudentObs(meta, dt)
     ik = FirmwareIK()

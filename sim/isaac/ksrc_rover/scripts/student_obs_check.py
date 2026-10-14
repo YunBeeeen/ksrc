@@ -45,7 +45,7 @@ def main():
     term = u.action_manager.get_term("rover")
     env.reset()
     zero = torch.zeros(u.num_envs, u.action_manager.total_action_dim, device=u.device)
-    err = {"gravity": [], "grav_settled": [], "wheel": [], "steer": []}
+    err = {"gravity": [], "grav_settled": [], "wheel": [], "steer": [], "gyro": []}
     dump = {"g_obs": [], "g_true": [], "ep_step": [], "done": []}
     for k in range(args.steps):
         obs, _, te, tr, _ = env.step(zero)
@@ -71,6 +71,7 @@ def main():
         settled = ok & (u.episode_length_buf > 50)          # 리셋 1 s 뒤부터 (공중 생성 → 착지 제외)
         err["grav_settled"].append(e_g[settled])
         err["wheel"].append((last["wheel_rate"] - robot.data.joint_vel[:, term.wheel_ids])[ok].abs().flatten())
+        err["gyro"].append((last["gyro"] - robot.data.root_ang_vel_b)[ok].norm(dim=-1))   # 20 ms 평균 vs 순간 참값
         q = robot.data.joint_pos[:, term.steer_ids] - term.servo.offset
         err["steer"].append(torch.rad2deg(last["steering"] - q)[ok].abs().flatten())
     for n, v in err.items():
