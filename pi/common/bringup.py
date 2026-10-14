@@ -149,37 +149,36 @@ def t_link(rec, a):
 
 # ---------------------------------------------------------------- 1. latency
 def t_latency(rec, a):
-    """vx 0 <-> 0.05 를 번갈아 보내고, 텔레메트리 cmd (Nucleo 가 IK 에 넣은 값) 가 바뀐 틱까지.
-    action delay = 보낸 뒤 처음 적용된 Nucleo 틱 - 보내기 직전 받은 틱 [제어 틱 = 정책 스텝]."""
-    rec.hold(1.0, rec.poll)
-    delays_tick, delays_ms, ages = [], [], []
-    vals = [0.05, 0.0] * int(a.reps)
-    for v in vals:
-        last = next((r[4] for r in reversed(rec.rows) if r[4] is not None), None)
-        t_send = time.monotonic()
-        tl = rec.vel(v, 0.0, 0.0)
-        got = None
-        for _ in range(10):
-            if tl is not None and abs(tl["cmd"][0] - v) < 1e-6:
-                got = tl
-                break
-            tl = rec.vel(v, 0.0, 0.0)
-        if got is not None and last is not None:
-            delays_tick.append((got["tick"] - last["tick"]) & 0xFF)
-            t_recv = rec.rows[-1][1]
-            delays_ms.append((t_recv - t_send) * 1000)
+    """vx 0 <-> 0.05 를 번갈아 보내고, Nucleo 가 그 명령을 처음 IK 에 넣은 제어 틱의 시각까지 [ms].
+    Nucleo 시계(t_ms)는 HSI 라 Pi 보다 0.3 % 쯤 빠르다 (10-14 실측) -> 두 시계 차이를 직선으로 맞추고
+    가장 신선한 프레임(아래 1 %) 을 나이 0 으로 둔다.  첫 0.5 s 의 묵은 프레임은 버린다."""
+    rec.hold(0.5, rec.vel, 0.0, 0.0, 0.0)
+    n0 = len(rec.rows)
+    events = []                       # (보낸 Pi 시각, 값)
+    for v in [0.05, 0.0] * int(a.reps):
+        events.append((time.monotonic(), v))
         rec.hold(0.4, rec.vel, v, 0.0, 0.0)
-    # 관측 나이: Pi 수신 시각 - Nucleo t_ms (시계 차이는 최솟값으로 맞춤 -> 상대값)
-    for ts, tr, kind, cmd, tlm in rec.rows:
-        if tlm is not None:
-            ages.append(tr * 1000 - tlm["t_ms"])
-    ages = np.array(ages) - np.min(ages)
-    dt = np.array(delays_tick)
-    print(f"  명령 → 적용: 틱 {dict(zip(*np.unique(dt, return_counts=True)))} (보낸 직전 받은 틱 기준), "
-          f"Pi 에서 확인까지 {np.mean(delays_ms):.1f} ms (최대 {np.max(delays_ms):.1f})")
-    print(f"  관측 나이 (상대, 최소 = 0): 평균 {ages.mean():.1f} ms, p95 {np.quantile(ages, .95):.1f}, 최대 {ages.max():.1f}")
-    ok = verdict(dt.max() <= 2, "명령은 1–2 틱 안에 적용 (시뮬 action_delay 0–1 스텝 + 텔레메트리 1 틱)")
-    ok &= verdict(np.quantile(ages, .95) < 25, "관측 나이 흔들림 < 25 ms (시뮬 obs_delay 1–2 스텝)")
+    rows = [r for r in rec.rows[n0:] if r[4] is not None]
+    tr = np.array([r[1] for r in rows]) * 1000
+    tms = np.array([r[4]["t_ms"] for r in rows], float)
+    app = np.array([r[4]["cmd"][0] for r in rows])
+    k = np.polyfit(tr, tr - tms, 1)                     # Pi 시각 - Nucleo 시각 = 직선 (시계 표류)
+    resid = (tr - tms) - np.polyval(k, tr)
+    k[1] += np.quantile(resid, 0.01)
+    ages = (tr - tms) - np.polyval(k, tr)
+    delays = []
+    for t_send, v in events:
+        j = np.nonzero((tr >= t_send * 1000) & (np.abs(app - v) < 1e-6))[0]
+        if len(j):
+            delays.append(tms[j[0]] + np.polyval(k, t_send * 1000) - t_send * 1000)
+    d = np.array(delays)
+    print(f"  Nucleo 시계 표류 {k[0] * 1e6:+.0f} ppm")
+    print(f"  명령 → 적용: 평균 {d.mean():.1f} ms, 최소 {d.min():.1f}, 최대 {d.max():.1f} "
+          f"= 정책 스텝 {d.min() / 20:.1f}–{d.max() / 20:.1f} (평균 {d.mean() / 20:.2f}), n={len(d)}")
+    print(f"  관측 나이 (프레임 생성 → 라파 수신): 평균 {ages.mean():.1f} ms, p95 {np.quantile(ages, .95):.1f}, "
+          f"최대 {ages.max():.1f}")
+    ok = verdict(d.max() < 60, "명령은 3 스텝 안에 적용 (시뮬 rover_env_cfg DR2 action_delay 와 비교)")
+    ok &= verdict(np.quantile(ages, .95) < 30, "관측 나이 < 30 ms (시뮬 obs_delay 와 비교)")
     return ok
 
 
