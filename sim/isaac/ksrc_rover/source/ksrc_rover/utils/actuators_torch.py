@@ -28,7 +28,11 @@ ENCODER_TICKS_PER_REV = 8384          # 16 PPR x4 x 131 (firmware main.c TICKS_P
 PWM_MAX = 799.0
 # Gearbox friction in duty units, 2026-10-13 bench (firmware/common/tests/wheel_pi_design.py):
 # kinetic 5 + Stribeck 41*exp(-|w|/0.13) (ramp-down stops at ~33 duty), stiction 47 (start 35-52).
-FRICTION_DUTY = dict(kinetic=5.0, stribeck=41.0, w_stribeck=0.13, static=47.0)
+# + ground load (2026-10-14, rover on concrete, bringup.py duty --vx 0.15): with the wheel PI the rover needs
+# FF + 45..70 duty (open loop 317 duty -> 0.120-0.127 m/s, lifted model says 0.150).  The lifted bench has no
+# wheel load and PhysX rigid wheels have almost no rolling resistance, so this is added as a constant
+# load torque (also raises the breakaway level on the ground).  Per-wheel DR friction_scale multiplies all.
+FRICTION_DUTY = dict(kinetic=5.0, stribeck=41.0, w_stribeck=0.13, static=47.0, ground=53.0)
 
 
 class SteerServo:
@@ -240,20 +244,22 @@ def drive_torque(duty: torch.Tensor, w: torch.Tensor, volt_scale=1.0, damping=No
 
 
 def wheel_friction(tau_drive: torch.Tensor, w: torch.Tensor, inertia, dt: float, scale=1.0,
-                   w_stick: float = 0.05) -> torch.Tensor:
+                   w_stick: float = 0.05, ground: bool = True) -> torch.Tensor:
     """Friction torque [N m] to add to the motor torque, Karnopp stick-slip for an explicit loop.
 
     Slipping (|w| >= w_stick): -sign(w) * (kinetic + Stribeck(|w|)), in duty units * tau_stall/799.
     Near standstill: the torque that stops the wheel within this step (-tau_drive - J*w/dt) if it is
     within stiction, else the kinetic level against the motor.  So a wheel stays put until the motor
     beats ~47 duty, as on the bench (the firmware PI's kick exists for this).  ``scale`` (N,4) or
-    scalar = per-wheel DR; ``inertia`` = joint armature [kg m^2]."""
+    scalar = per-wheel DR; ``inertia`` = joint armature [kg m^2].  ``ground`` adds the measured ground load
+    (rolling resistance + loaded gearbox) to the kinetic and breakaway levels; False = lifted wheel (bench)."""
     c = FRICTION_DUTY
     u = DRIVE_EFFORT_NM / PWM_MAX * scale
-    f_kin = (c["kinetic"] + c["stribeck"] * torch.exp(-w.abs() / c["w_stribeck"])) * u
+    g = c["ground"] if ground else 0.0
+    f_kin = (c["kinetic"] + g + c["stribeck"] * torch.exp(-w.abs() / c["w_stribeck"])) * u
     hold = -tau_drive - inertia * w / dt
     moving = w.abs() >= w_stick
-    stick = ~moving & (hold.abs() <= c["static"] * u)
+    stick = ~moving & (hold.abs() <= (c["static"] + g) * u)
     s = torch.where(moving, torch.sign(w), torch.sign(tau_drive))
     return torch.where(stick, hold, -s * f_kin)
 

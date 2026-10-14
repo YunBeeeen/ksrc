@@ -11,6 +11,17 @@ means in m/s, rad/s, split like scripts/eval_analyze.py:
   spin_slick / spin_grip           mean |surface - ground speed| [m/s] of slick / grippy wheels
 Logged as Metrics/base_velocity/<name>. Values are pooled over the envs that reset at a
 step (sum / count), so a short episode does not weigh as much as a full one.
+
+Rate limit (2026-10-14): a resampled command is a *target*; the command the policy sees and is scored on
+moves toward it like a path follower would: the xy velocity as (signed speed s, direction phi), phi turning
+at most dir_rate [rad/s] and s changing at most acc_lin [m/s^2], omega at most acc_ang [rad/s^2].
+phi lives in (-90, 90] deg around the current one: going the opposite way is a speed sign flip (the
+firmware IK reverses the wheels instead of steering 180 deg), so a reversal passes s through 0 without
+swinging the direction.  (A straight-line ramp in (vx, vy) passes near 0 speed where the direction swings
+fast -- it made the gate hold MORE, 13 -> 17 %, first try 10-14.)  A fraction abrupt_prob of resamples still jumps at once (evasive moves, joystick).
+An episode starts from a standing command.  acc_* <= 0 turns the limit off (old behaviour).
+Why: with every 2-6 s command jumping in direction, the firmware drive-align gate held the wheels 17 %
+of the time in sim (IK, 10-14 eval) -- far more than a Nav2-driven rover sees.
 """
 
 import torch
@@ -32,6 +43,13 @@ class RoverVelocityCommand(UniformVelocityCommand):
         self._cnt = torch.zeros(n, k, device=self.device)
         self._t_cmd = torch.zeros(n, device=self.device)
         self._last = {key: 0.0 for key in _KEYS}   # logged when no reset env has such steps
+        self._target = torch.zeros(n, 3, device=self.device)     # sampled command (rate limit goes toward it)
+        self._out = torch.zeros(n, 3, device=self.device)        # what the policy sees
+        self._s = torch.zeros(n, device=self.device)             # signed xy speed of _out
+        self._phi = torch.zeros(n, device=self.device)           # its direction, (-pi/2, pi/2] kept near itself
+        self._abrupt = torch.zeros(n, dtype=torch.bool, device=self.device)
+        if getattr(cfg, "heading_command", False) and cfg.acc_lin > 0:
+            raise ValueError("command rate limit assumes heading_command=False")
 
     def _update_metrics(self):
         super()._update_metrics()
@@ -61,9 +79,45 @@ class RoverVelocityCommand(UniformVelocityCommand):
     def _resample_command(self, env_ids):
         super()._resample_command(env_ids)
         self._t_cmd[env_ids] = 0.0
+        if self.cfg.acc_lin > 0:
+            self._target[env_ids] = self.vel_command_b[env_ids]
+            self._abrupt[env_ids] = torch.rand(len(env_ids), device=self.device) < self.cfg.abrupt_prob
+            self.vel_command_b[env_ids] = self._out[env_ids]     # keep the current command; ramp in _update
+
+    def _update_command(self):
+        if self.cfg.acc_lin <= 0:
+            super()._update_command()
+            return
+        import math
+        tgt = self._target.clone()
+        tgt[self.is_standing_env.nonzero(as_tuple=False).flatten()] = 0.0
+        dt = self._env.step_dt
+        s_t = torch.linalg.norm(tgt[:, :2], dim=1)
+        phi_t = torch.atan2(tgt[:, 1], tgt[:, 0])
+        # target direction within +-90 deg of the current one (else flip it and the speed sign)
+        dphi = torch.remainder(phi_t - self._phi + math.pi, 2 * math.pi) - math.pi
+        flip = dphi.abs() > math.pi / 2
+        dphi = torch.where(flip, dphi - torch.sign(dphi) * math.pi, dphi)
+        s_t = torch.where(flip, -s_t, s_t)
+        moving = (s_t.abs() > 1e-4) | (self._s.abs() > 1e-4)
+        # standing start: take the target direction at once (nothing to steer away from)
+        fresh = self._s.abs() <= 1e-4
+        phi = torch.where(fresh, self._phi + dphi, self._phi + dphi.clamp(-self.cfg.dir_rate * dt, self.cfg.dir_rate * dt))
+        phi = torch.where(moving, phi, self._phi)
+        s_new = self._s + (s_t - self._s).clamp(-self.cfg.acc_lin * dt, self.cfg.acc_lin * dt)
+        w_new = self._out[:, 2] + (tgt[:, 2] - self._out[:, 2]).clamp(-self.cfg.acc_ang * dt, self.cfg.acc_ang * dt)
+        ab = self._abrupt
+        phi_ab = phi_t
+        self._phi = torch.where(ab, phi_ab, phi)
+        self._s = torch.where(ab, torch.linalg.norm(tgt[:, :2], dim=1), s_new)
+        w_new = torch.where(ab, tgt[:, 2], w_new)
+        self._out = torch.stack((self._s * torch.cos(self._phi), self._s * torch.sin(self._phi), w_new), dim=1)
+        self.vel_command_b[:] = self._out
 
     def reset(self, env_ids=None):
         ids = slice(None) if env_ids is None else env_ids
+        self._out[ids] = 0.0                                     # an episode starts standing
+        self._s[ids] = 0.0
         s, c = self._sum[ids].sum(dim=0), self._cnt[ids].sum(dim=0)
         extras = super().reset(env_ids)
         for i, key in enumerate(_KEYS):
@@ -78,3 +132,7 @@ class RoverVelocityCommand(UniformVelocityCommand):
 @configclass
 class RoverVelocityCommandCfg(UniformVelocityCommandCfg):
     class_type: type = RoverVelocityCommand
+    acc_lin: float = 0.0          # [m/s^2] command rate limit (xy norm). 0 = off
+    acc_ang: float = 0.0          # [rad/s^2]
+    abrupt_prob: float = 0.0      # fraction of resamples that still jump at once
+    dir_rate: float = 1.5         # [rad/s] max turn rate of the xy command direction (servo ~1.8 rad/s avg over 90 deg)

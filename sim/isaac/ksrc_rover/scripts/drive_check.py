@@ -49,7 +49,7 @@ def main():
     robot = u.scene["robot"]
     term = u.action_manager.get_term("rover")
     print(f"DRIVE_CHECK drive={term.drive} envs={u.num_envs}", flush=True)
-    log = {"err": [], "w_t": [], "w": [], "duty": [], "ep": [], "gate": []}
+    log = {"err": [], "w_t": [], "w": [], "duty": [], "ep": [], "gate": [], "goal": [], "ik": []}
     _apply = term.apply_actions
 
     def apply_actions():
@@ -59,6 +59,8 @@ def main():
         log["duty"].append(term.duty.clone())
         log["ep"].append(u.episode_length_buf.clone())
         log["gate"].append(term.gate_hold.clone())
+        log["goal"].append(term._processed[:, :4].clone())
+        log["ik"].append(term.ik.last_angle.clone())
 
     term.apply_actions = apply_actions
     env.reset()
@@ -85,6 +87,15 @@ def main():
     stats("body |v_xy err| [m/s]", torch.cat(exy))
     g = L["gate"][L["ep"] > 50].float()
     print(f"DRIVE_CHECK gate={term.gate_on} 보류 비율 {g.mean():.4f}", flush=True)
+    # 게이트 원인: 조향 목표가 한 제어 틱에 60 도 넘게 튄 것 (물리 4 스텝마다 같은 값이라 4 칸 간격)
+    goal = L["goal"][::4]; ik = L["ik"][::4]; ep = L["ep"][::4]
+    ok = (ep[1:] > 1) & (ep[:-1] > 0)
+    jump = ((goal[1:] - goal[:-1]).abs().amax(-1) > 1.047) & ok
+    fold = ((goal[1:] - goal[:-1]).abs().amax(-1) > 2.6) & ok           # ~180 도 = 가동범위 이음매 접기
+    ikj = ((ik[1:] - ik[:-1]).abs().amax(-1) > 1.047) & ok             # IK 원래 방향(접기 전)이 튐 = 명령 탓
+    n = ok.sum().clamp(min=1)
+    print(f"DRIVE_CHECK 목표 60도 넘게 튐 {jump.sum() / n:.4f}/틱 (그중 ~180도 접기 {fold.sum() / n:.4f}, "
+          f"IK 방향 자체가 튐 {ikj.sum() / n:.4f})", flush=True)
     env.close()
 
 

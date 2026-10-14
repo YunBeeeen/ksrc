@@ -54,6 +54,12 @@ COM_RANGE_M  = (0.02, 0.02, 0.01)  # base_link 무게중심 이동 ±x,y,z [m] (
 # 주의: Isaac Lab error_vel_* 지표는 (최대 재샘플 시간)으로 나눠 에피소드 내내 누적하므로
 #   재샘플 < 에피소드면 m/s 평균이 아니다(여기선 ×16/6≈2.7). 정확한 값은 eval_analyze 로.
 CMD_RESAMPLE_S = (2.0, 6.0)
+# 명령 변화율 제한 (10-14): 새 명령은 목표가 되고, 정책이 받는 명령은 이 가속으로 따라감 (Nav2 속도 평활기처럼).
+#   20 % 는 지금처럼 즉시 바뀜 (회피·조이스틱).  0 이면 끔 (10-13 까지).  IK 기준 게이트 대기가 17 % 였음.
+CMD_ACC_LIN  = 0.5             # [m/s^2]  0.25 -> -0.25 반전에 1 s
+CMD_ACC_ANG  = 2.0             # [rad/s^2] -1 -> +1 에 1 s
+CMD_ABRUPT_P = 0.2
+CMD_DIR_RATE = 1.5             # [rad/s] 명령 방향 회전 한계 (86 °/s, 서보 90° 0.87 s 보다 조금 느리게)
 EPISODE_S    = 16.0
 # DR 단계. 1 = μ·지형·질량·명령(위). 2 = + 모터·서보·지연·센서노이즈(아래 DR2). 관측 크기는 같아서
 # 1단계 teacher 체크포인트를 2단계로 이어 학습(--resume) 할 수 있다.
@@ -69,8 +75,9 @@ DR2 = dict(
     servo_offset_deg=0.6,              # 바퀴별 조향각 오차 ± (조향 링크 놀음 ~1 mm, 10-13)
     servo_deadband_deg=(0.15, 0.35),   # 이 안의 목표 변화는 무시 (실측 최소 명령 0.3–0.5°, 히스테리시스 0.37°)
     servo_delay_s=(0.030, 0.038),      # 목표 쓰기 → 움직임 시작 (실측 33–34.5 ms). SPI 지연(action_delay)과 별개
-    action_delay=(0, 1),          # [정책 스텝] 명령은 다음 SPI 교환·Nucleo 틱부터
-    obs_delay=(1, 2),             # [정책 스텝] 텔레메트리는 직전 50Hz 주기에 만든 것
+    action_delay=(1, 2),          # [정책 스텝] 10-14 실측: Pi 송신 -> Nucleo 가 IK 에 넣기까지 17.6-46.5 ms (평균 30 = 1.5 스텝)
+    obs_delay=(0, 1),             # [정책 스텝] 10-14 실측: 텔레메트리 프레임 생성 -> Pi 수신 평균 14 ms, 최대 29 ms
+                                  #   (bringup.py latency, 시계 표류 보정. 10-13 까지는 action (0,1) / obs (1,2))
     gyro_bias=0.01,               # [rad/s] 에피소드마다 고정 바이어스 ±
 )
 # 넓힌 DR (2026-10-13): --set DR_WIDE=True 이면 위 MU_PATCH·MASS_SCALE·COM_RANGE_M·DR2 대신 이 값.
@@ -82,7 +89,7 @@ MASS_SCALE_WIDE = (0.9, 1.35)
 COM_RANGE_M_WIDE = (0.03, 0.03, 0.015)
 DR2_WIDE = dict(DR2, voltage_scale=(0.8, 1.1), motor_spread=0.10, damping_scale=(0.7, 1.3),
                 armature_range=(7.4e-3, 12.3e-3),        # 9.8e-3 ±25%
-                drive_friction_scale=(0.6, 1.4),
+                drive_friction_scale=(0.6, 2.0),         # 지면 하중 포함 32–106 duty: 복도 실측(53) 위로 모래 추정. 10-18 모래 실측으로 확정
                 servo_rate_scale=(0.75, 1.1), servo_stiffness_scale=(0.7, 1.3),
                 servo_offset_deg=1.0, servo_deadband_deg=(0.1, 0.5), servo_delay_s=(0.026, 0.045),
                 gyro_bias=0.02)
@@ -360,6 +367,10 @@ class RoverBaseEnvCfg(ManagerBasedRLEnvCfg):
         self.decimation = 4
         self.episode_length_s = EPISODE_S
         self.commands.base_velocity.resampling_time_range = CMD_RESAMPLE_S
+        self.commands.base_velocity.acc_lin = CMD_ACC_LIN
+        self.commands.base_velocity.acc_ang = CMD_ACC_ANG
+        self.commands.base_velocity.abrupt_prob = CMD_ABRUPT_P
+        self.commands.base_velocity.dir_rate = CMD_DIR_RATE
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         # rough_slope(318k tri) 는 여러 PhysX GPU 버퍼를 넘긴다(contact 드롭=물리 부정확).

@@ -200,7 +200,7 @@ def test_student_sensors():
     check(abs(math.degrees(q.item()) - 10.020) < 1e-3, f"서보 격자 10.04° → {math.degrees(q.item()):.3f}° (0.088° 격자)")
 
 
-def _wheel_run(duty_fn, t_end, w0=0.0, scale=1.0, load=0.0):
+def _wheel_run(duty_fn, t_end, w0=0.0, scale=1.0, load=0.0, ground=False):
     """One lifted wheel at 5 ms like the Isaac "pi" drive: motor line + friction, armature only.
     duty_fn(k, w_enc) is called every 20 ms (4 steps) with the encoder speed of the last 20 ms."""
     from ksrc_rover.utils.contract import DRIVE_ARMATURE
@@ -213,7 +213,7 @@ def _wheel_run(duty_fn, t_end, w0=0.0, scale=1.0, load=0.0):
             duty = duty_fn(k // 4, encoder_speed(t_now, t_prev, 0.02) if k else torch.zeros(1))
             t_prev = t_now
         tau = drive_torque(duty, w) - load
-        tau = tau + wheel_friction(tau, w, J, dt, scale)
+        tau = tau + wheel_friction(tau, w, J, dt, scale, ground=ground)
         w = w + tau / J * dt
         th = th + w * dt
         ws.append(float(w))
@@ -239,6 +239,21 @@ def test_drive_pi():
         check(t90 <= t90_max and abs(ss - w_ref) < 0.05 * w_ref + 0.02,
               f"PI 0→{w_ref} rad/s: 90% {t90 * 1000:.0f} ms (설계 시뮬 2→37, 0.3→28 ms), 정상 {ss:.3f}")
         check(not pi.stall.any() and not pi.enc_dir.any() and not (pi.enc_trips > 0).any(), f"PI 0→{w_ref}: 보호 안 걸림")
+    # 지면 하중 (10-14 실물: 개루프 317 duty -> 0.120-0.127 m/s, PI 는 FF + 45..70)
+    w_ol = _wheel_run(c(317), 1.0, ground=True)
+    v_ol = w_ol[-50:].mean() * 0.047503
+    check(0.115 < v_ol < 0.13, f"지면: 개루프 317 duty -> {v_ol:.3f} m/s (실물 0.120-0.127)")
+    pi = WheelPI(1)
+    dd = []
+
+    def on_ground(k, we):
+        u = pi.step(torch.full((1, 4), 0.15 / 0.047503), we.expand(1, 4))[:, 0]
+        dd.append(float(u))
+        return u
+    w_pi = _wheel_run(on_ground, 1.5, ground=True)
+    extra = np.mean(dd[-20:]) - (0.15 / 0.047503 / 0.0097 + 5)
+    check(abs(w_pi[-50:].mean() * 0.047503 - 0.15) < 0.003 and 40 < extra < 70,
+          f"지면: PI 0.15 m/s 유지, FF 보다 +{extra:.0f} duty (실물 +45..70)")
     # 막힌 바퀴 (돌에 걸림): 마찰 ×20 (정지마찰 940 duty) 이라 앞뒤 어느 쪽으로도 안 돎 -> 보정 상한 + 스톨로 duty 가 FF 로 내려옴
     pi = WheelPI(1)
     duties = []
