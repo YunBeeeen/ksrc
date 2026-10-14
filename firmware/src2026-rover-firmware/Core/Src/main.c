@@ -231,9 +231,10 @@ static drive_align_gate_t s_gate;
 
 /* === 바퀴 속도 PI (common/wheel_pi.h, MOTOR_MODELING_PLAN.md §8) ===
  * ON 이면 duty = FF + 기준 모델 PI (엔코더 속도를 목표에 맞춤), OFF 면 예전 개루프
- * duty = v / SWERVE_MAX_WHEEL_MPS × 799.  벤치(WCAP)·지면 확인 전이라 기본 OFF, WPI ON 으로 켠다.
- * 확인 끝나면 1 로 바꾼다 (시뮬은 PI 를 가정하고 학습한다). */
-#define WHEEL_PI_DEFAULT_ON  0
+ * duty = v / SWERVE_MAX_WHEEL_MPS × 799.  2026-10-14 실물 확인 뒤 기본 ON (시뮬도 PI 로 학습):
+ *   벤치 계단 0->2 rad/s 90% 41–51 ms, 지면 0.15 m/s 직진 네 바퀴 정확히 0.150 (개루프 0.120–0.127),
+ *   바퀴 간 duty 차이 7 %, 스톨 보호 동작.  개루프로 돌리려면 터미널 `WPI OFF`. */
+#define WHEEL_PI_DEFAULT_ON  1
 static uint8_t           s_wpi_on = WHEEL_PI_DEFAULT_ON;
 static wheel_pi_cfg_t    s_wpi_cfg;
 static wheel_pi_state_t  s_wpi[SWERVE_NUM_MODULES];     /**< 모듈 순서 */

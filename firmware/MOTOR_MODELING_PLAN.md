@@ -220,7 +220,7 @@ DR 은 물리 관계를 지킨다: 전압은 정지토크·무부하속도를 �
 ## 8. 펌웨어 속도 PI (2026-10-13 설계·구현, 벤치 미확인)
 
 **코드**: `common/wheel_pi.{h,c}` (순수 C, 호스트 테스트 `common/tests/test_wheel_pi.c`), `main.c` `Swerve_Control` 에서 호출.
-터미널 `WPI ON/OFF/SET`, 벤치 캡처 `WCAP`, 노트북 `sysid_uart.py pi`. **기본 OFF** (`WHEEL_PI_DEFAULT_ON`) — 벤치·지면 확인 뒤 1 로.
+터미널 `WPI ON/OFF/SET`, 벤치 캡처 `WCAP`, 노트북 `sysid_uart.py pi`. **기본 ON** (`WHEEL_PI_DEFAULT_ON 1`, 10-14 벤치·지면 확인: 계단 41–51 ms, 지면 0.15 m/s 정확, 바퀴 간 duty 7 %).
 시뮬: MuJoCo/가짜 펌웨어는 `sim/libksrc_common.so` 로 **같은 C** 를 부른다 (`sim/ksrc_common.py WheelPi`).
 Isaac(GPU 배치)은 torch 로 옮기고 `WheelPi` 와 같은 입력열로 비교 검증할 것 (미구현).
 
