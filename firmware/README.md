@@ -5,8 +5,9 @@
 엔코더·서보·IMU 값을 Raspberry Pi 로 올려 보낸다.
 
 > 실행 명령만 필요하면 **[CLI.md](CLI.md)**. 이 문서는 설정값과 구조의 정본이다.
-> 상태 기준일: 2026-10-03. 2026-09-29 이후 변경(50Hz 제어주기, 정렬 게이트, SPI2 링크,
-> IMU, 서보 피드백)은 **빌드는 되지만 실기 검증 전**이다.
+> 상태 기준일: 2026-10-16. 50Hz 제어주기·정렬 게이트·SPI2 링크·IMU·서보 피드백·바퀴 PI 는
+> 10-13 굽고 10-14 실기 확인 (bringup `link` `encdir` `latency` `res` `gate` PASS, 지면 0.15 m/s PI 정확, `WHEEL_PI_DEFAULT_ON 1`).
+> SPI 설정 프레임 0x03 (`spi_link.c`) 판은 **빌드만 됨, 16일 굽기** (`./build.sh --flash`). 측정값 정본은 `MOTOR_MODELING_PLAN.md` §0.
 
 ---
 
@@ -98,14 +99,14 @@ SPI2 명령 프레임   ─┴─> 목표 (vx, vy, ω) 만 갱신
 |---|---|---|---|
 | 서보 ID ↔ 바퀴 | `joint.c` `joint_config[]` | 서보1 LF, 서보2 LB, 서보3 RF, 서보4 RB | 확정 |
 | 모듈 → 서보 | `main.c` `SWERVE_MODULE_SERVO` | `{0, 2, 1, 3}` (FL→서보1, FR→서보3, RL→서보2, RR→서보4) | 확정 |
-| 조향 영점 | 서보 EEPROM (`ZERO`) | 미기록 | **임시** — 조립 후 |
+| 조향 영점 | 서보 EEPROM (`ZERO`) | 기록 없음 | **확인 필요** — 10-14 지면 직진·게이트 시험은 정상이었지만 `ZERO ALL` 을 했는지 기록이 없다. 16일 측정 전 `T 0 0 0 0` 에서 네 바퀴가 정면인지 눈으로 확인 |
 | 영점 위치값 | `joint.c` `.offset` | 2048 (`ZERO` 가 현재 자세를 2048 로 기록) | 확정 |
 | 조향 방향 | `joint.c` `.dir` | 전부 +1 | **임시** — `T 30` 이 위에서 반시계면 +1. 뒤쪽 서보(LB, RB)는 앞쪽과 **월드 z축 기준 180°** 돌려 장착(둘 다 아래를 봄) → 회전 방향은 같으므로 네 서보 `dir` 부호는 같아야 함. 영점 차이는 `ZERO ALL` 이 흡수 |
-| 가동범위 | `joint.c` `.min_deg/.max_deg` | 전부 -90° ~ +90° (URDF 관절 한계와 같게, 2026-10-11) | 조립 후 실측. 폭 ≥ 180° 유지 |
+| 가동범위 | `joint.c` `.min_deg/.max_deg` | 전부 -90° ~ +90° (URDF·Isaac·MuJoCo 와 같게, 2026-10-11 결정) | 확정 (결정값). 바퀴별 간섭각 실측은 안 함. 폭 ≥ 180° 유지 |
 | 시뮬 가동범위 | `sim/rl/config.py` `steer_lo_deg/steer_hi_deg`, Isaac `contract.STEER_LIMIT_RAD` | 전부 ±90° (순서 FL, FR, RL, RR) | 펌웨어와 **같이** 고칠 것 |
 | 조향 0° 의 뜻 | — | 바퀴 정면, 구동모터 몸체 안쪽, + 는 위에서 반시계 | 확정 (시뮬과 동일) |
 | 서보 최고속 | `joint.c` `joint_goal_speed` | 0 = 서보 최대 (제한 없음). 터미널 `S` 로 변경 | 단위 step/s, 4096 step = 360° |
-| 서보 가속도 | `joint.c` `joint_init()` | 50 | 가정 (단위 미실측) |
+| 서보 가속도 | `joint.c` `joint_init()` | 50 | **실측 10-13: ACC 레지스터는 효과 없음** (0/50/100/254 모두 같은 7.7 rad/s² 사다리꼴, 90° 0.87 s, 시작 지연 34 ms, 데드존 ±0.19°). 시뮬 서보 모델이 이 값을 씀 |
 | 서보 수신 타임아웃 | `sts3215.c` `STS_RX_TIMEOUT_MS` | 3 ms | 확정 |
 | 서보 읽기 실패 재시도 | `main.c` `SERVO_RETRY_TICKS` | 25 주기 (0.5 s), 한 주기에 1개만 재시도 | 확정 |
 
@@ -120,13 +121,13 @@ SPI2 명령 프레임   ─┴─> 목표 (vx, vy, ω) 만 갱신
 |---|---|---|---|
 | 모터 번호 ↔ 바퀴 | — | MOTOR1 LF, MOTOR2 LB, MOTOR3 RF, MOTOR4 RB (조향 서보와 같은 배치) | **확정 2026-10-03** |
 | 모듈 → 구동모터 | `main.c` `SWERVE_MODULE_MOTOR` | `{MOTOR1, MOTOR3, MOTOR2, MOTOR4}` (FL, FR, RL, RR) | 확정 |
-| 구동 부호 | `main.c` `MOTOR_DRIVE_SIGN[MOTOR1..4]` | −1, −1, +1, +1 (LF, LB, RF, RB) | 2026-10-03. 모터를 넷 다 같은 방식으로 달아 **좌우 대칭** (L −1, R +1). RF 는 −1 로 관찰돼 확인 필요 |
-| 엔코더 부호 | `main.c` `ENCODER_SIGN[MOTOR1..4]` | −1, −1, +1, +1 | MOTOR1 이 duty + 에서 tick + (실측) → 구동 부호와 같음. `V 0.05 0 0` 에서 m/s 가 넷 다 + 인지 확인 |
+| 구동 부호 | `main.c` `MOTOR_DRIVE_SIGN[MOTOR1..4]` | −1, −1, +1, +1 (LF, LB, RF, RB) | **확정 2026-10-14** (bringup `encdir` PASS: 0.05 m/s 명령에 네 바퀴 모두 + 0.038–0.043 m/s). 좌우 대칭 장착 |
+| 엔코더 부호 | `main.c` `ENCODER_SIGN[MOTOR1..4]` | −1, −1, +1, +1 | **확정 2026-10-14** (같은 `encdir`). 구동 부호와 같음 |
 | 기어비 | `main.c` `GEAR_RATIO` | 131 (SPG30E-GR131) | 확정 |
 | 엔코더 PPR | `main.c` `ENCODER_PPR` | 16 (x4 → 64, 바퀴 1회전 8384 틱) | **확정 2026-10-03** (무부하 77.8 rpm) |
 | 바퀴 반경 | `main.c` `WHEEL_RADIUS_M` | 0.047503 m (URDF rover_wheel_rev4) | 2026-10-12 URDF·Isaac 과 맞춤 (옛 0.03995 는 rev_2, 19% 작았음) |
-| 바퀴 최고속 | `main.c` `SWERVE_MAX_WHEEL_MPS` | 0.378 m/s (= duty 100%, 7.96 rad/s × 반경) | 시뮬과 일치시킨 가정. 실측 무부하 77.8 rpm → 0.387 m/s (+2%). D1 로 확정 |
-| 모듈 위치 | `main.c` `SWERVE_MODULES` | (±0.105, ±0.1325) m (조향축 = 바퀴 중심) | **실측 2026-10-03**. 시뮬 `axle_x=0.105`, `track=0.265` 와 동일 |
+| 바퀴 최고속 | `main.c` `SWERVE_MAX_WHEEL_MPS` | 0.378 m/s (= duty 100%, 7.96 rad/s × 반경) | **확정 2026-10-13** (D1: 무부하 7.68 rad/s @ 11.65 V, 7.53 @ 11.25 V, 개체차 ±2.4% → 12 V 환산 ≈ 7.9) |
+| 모듈 위치 | `main.c` `SWERVE_MODULES` | (±0.102431, ±0.1325) m (조향축 = 타이어 중앙) | **CAD 확정** (rev5 조립본). Isaac `contract.MODULE_XY_M`·MuJoCo `rover_rev5.xml` 과 같음 |
 
 조립 전 날것 방향 기록 (`MOT`, 부호 보정 없음, 샤프트 끝에서 볼 때):
 
@@ -162,7 +163,8 @@ SPI2 명령 프레임   ─┴─> 목표 (vx, vy, ω) 만 갱신
 | 가속도 | 208 Hz, ±4 g (0.122 mg/LSB) |
 | 자이로 | 208 Hz, ±500 dps (17.5 mdps/LSB) |
 | 기타 | BDU=1, 주소 자동증가. 부팅 시·1초마다 WHO_AM_I(0x6B) 확인, 끊기면 재초기화 |
-| 좌표계 | **센서 좌표계 원시값**. 차체 좌표계 회전은 Pi 에서 (장착 방향 확인 필요) |
+| 좌표계 | **센서 좌표계 원시값**. 차체 좌표계 회전은 Pi 에서. 축 부호는 16일 `MEASURE_1016.md` M2 (반시계 → gyro z +, 앞 들기 → gravity x −, 왼쪽 들기 → gravity y −) 로 확정 |
+| 실측 (10-14) | 자이로 바이어스 ~0.01 rad/s. 몸체 앞뒤 유격 −2.2° ~ +2.7° (베벨기어·로커) — 고정 장착 보정은 안 넣음 |
 
 ---
 
@@ -246,6 +248,9 @@ python3 pi/teleop/teleop_joystick.py --udp raspberrypi.local --rate 50 --max-lin
 | Z6 | 엔코더 방향 | `main.c` `ENCODER_SIGN` | Z5 후 `LOG` m/s 가 음수인 모터 → -1 |
 
 Z1 → Z2 → Z3 순서대로. 같은 목록이 옵시디언 `실기 확인 목록` 0절에 있다.
+
+**상태 (2026-10-16)**: Z4 (10-03 배치 확정), Z5·Z6 (10-14 `encdir` PASS) 완료. Z3 는 ±90° 로 결정 (바퀴별 간섭각 실측은 안 함).
+Z1·Z2 는 10-14 지면 주행이 정상이라 크게 틀리진 않았지만 **기록이 없다** → 측정 전 `T 0 0 0 0` (네 바퀴 정면), `T 30` (위에서 반시계) 으로 눈 확인.
 
 ---
 

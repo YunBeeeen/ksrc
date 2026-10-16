@@ -4,12 +4,56 @@
 
 | 다른 명령 | 문서 |
 |---|---|
-| 학습·증류·평가·재생 (`sim/rl`) | [sim/CLI.md](sim/CLI.md) |
+| **Isaac 학습·증류·평가·내보내기, MuJoCo sim2sim (지금 주력)** | [sim/isaac/ksrc_rover/CLI.md](sim/isaac/ksrc_rover/CLI.md) |
+| 라파: RL 정책 실행, 실측 절차 | [pi/README.md](pi/README.md), [pi/MEASURE_1016.md](pi/MEASURE_1016.md), [pi/MEASURE_1017.md](pi/MEASURE_1017.md) |
+| 옛 SB3 학습·증류·평가·재생 (`sim/rl`) | [sim/CLI.md](sim/CLI.md) |
 | 펌웨어 빌드·플래시·터미널·세팅·조이스틱 직결·Pi SPI | [firmware/CLI.md](firmware/CLI.md) |
 
 ---
 
-## 0. 네 가지 조합 — 어느 명령을 쓸지
+## 0. ★ 지금 쓰는 것 (2026-10-16): `nav2_isaac.launch.py` — MuJoCo rev5 + Nav2 + RViz 에서 IK / RL 비교
+
+Isaac 에서 학습한 정책(teacher·student)을 노트북 MuJoCo 에서 Nav2 목표 주행으로 돌린다.
+로버는 Isaac 과 같은 `rover_rev5_isaac_cyl.urdf` (원기둥 바퀴), 서보·구동 PI·게이트·지연은 Isaac 과 같은 모델 (`sim/rl/sim2sim_isaac.py`).
+
+```bash
+source /opt/ros/humble/setup.bash
+# IK 로 시작, 정책 같이 로드 (전환은 /set_rl)
+ros2 launch ~/ksrc/ros/nav2_isaac.launch.py soil:=sand mu:=const:0.4 start_ik:=true \
+  policy:=$HOME/ksrc/sim/rl/runs/isaac/2026-10-15_13-06-32_student_mlp_v1_rc4000/model_1000.pt
+# student v3 (VO): VO 켬 / 끔
+ros2 launch ~/ksrc/ros/nav2_isaac.launch.py soil:=sand mu:=const:0.4 start_ik:=true vo:=dr \
+  policy:=$HOME/ksrc/sim/rl/runs/isaac/2026-10-15_19-32-46_student_mlp_v3vo_rc4000/model_1000.pt
+```
+```bash
+# 다른 터미널 (같은 도메인)
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=77 ROS_LOCALHOST_ONLY=1
+ros2 service call /set_rl std_srvs/srv/SetBool "{data: true}"     # RL 켬 (false = 순수 IK)
+ros2 service call /reset_sim std_srvs/srv/Trigger                  # 스폰으로 리셋
+ros2 topic echo /bridge_status                                      # 2초 지표 JSON
+```
+
+| 인자 | 기본 | 뜻 |
+|---|---|---|
+| `policy` | (없음 = IK 만) | `model_XXXX.pt` 경로. 옆에 `params/` 가 있어야 함 (서버 런 폴더에서 `model_*.pt` + `params/` 를 `sim/rl/runs/isaac/<런>/` 로 복사) |
+| `start_ik` | false | 정책을 불러오되 IK 로 시작 |
+| `terrain` | sand | sand / rock (대회 STL 높이맵, Nav2 맵과 같은 좌표) |
+| `soil` | rigid | rigid = 강체 쿨롱 마찰 / sand = terramech (슬립-침하, 주행저항) |
+| `mu` | const:0.5 | `const:μ` (4바퀴 같음) / `uniform:lo,hi` / `patch`. sand 에서는 최대 견인 계수 μ_max |
+| `nav_model` | rpp | rpp = RotationShim + Regulated Pure Pursuit (권장) / diff = MPPI DiffDrive / omni = MPPI 옆걸음 (±90° 접기 경계에서 조향 뒤집힘) |
+| `smoother` | true | velocity_smoother (0.5 m/s², 2 rad/s²) |
+| `gate` | new | 구동 정렬 게이트: new = 현 펌웨어·Isaac (10-13 실측 트리거 포함) / old / off |
+| `vo` | dr | student v3 VO 관측: dr = 학습 VO 모델 (지연 60–300 ms, 5–17 Hz, 잡음, 끊김) / off = 항상 무효 (VO 없는 Pi) |
+| `view` / `rviz` | true | MuJoCo 창 / RViz |
+
+브리지 2초 로그: `[RL|IK] xy오차 (m/s) 요오차 (rad/s) 큰헛돎 게이트% 조향 흔들림 명령 ±° 실제 ±° μ`.
+조향 흔들림 = 스텝마다 뒤집히는 떨림의 진폭 (명령 = 정책+IK 목표, 실제 = 서보를 거친 조향각). IK 접기 반전(>20°/스텝)은 뺀다.
+`Control loop missed its desired rate of 50 Hz` 경고가 1초마다 경로 갱신 직후 한 번 뜨는 것은 정상 (주행 영향 없음).
+
+---
+
+## 0-1. (옛 구성) 네 가지 조합 — `nav2_ksrc.launch.py` + SB3 MuJoCo 환경
 
 **목표를 어떻게 주느냐**(RViz 클릭 / 텔레옵) × **차체명령을 누가 내느냐**(순수 IK / RL 잔차)
 의 조합이다. 어느 경우든 그 아래 **펌웨어와 같은 공유 C 기구학**

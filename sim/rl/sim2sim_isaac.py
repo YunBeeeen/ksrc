@@ -238,15 +238,71 @@ TERM_SOURCES = {
 }
 
 
+class VoSim:
+    """numpy port of mdp/vo.py VoVelocityObs (student v3, 2026-10-16) for one rover.
+    True body velocity -> held every k steps, delay_steps old, scale error, noise growing with |wz|,
+    spikes, outages (off_prob: whole episode without VO).  Output [vx, vy, valid, age] as the Pi feeds it.
+    mode "dr" = the run's VO_DR as trained, "off" = never valid (what the Pi sends without a VO stream)."""
+
+    def __init__(self, dr, rng, dt=CONTROL_DT_S, mode="dr"):
+        self.p = dict(dr)
+        if mode == "off":
+            self.p["off_prob"] = 1.0
+        self.rng, self.dt, self.mode = rng, dt, mode
+        self.L = int(self.p["delay_steps"][1]) + 1
+        self.reset()
+
+    def reset(self):
+        p, r = self.p, self.rng
+        self.hist = None
+        self.t = 0
+        self.k = int(r.integers(int(p["rate_steps"][0]), int(p["rate_steps"][1]) + 1))
+        self.delay = int(r.integers(int(p["delay_steps"][0]), int(p["delay_steps"][1]) + 1))
+        self.sigma = float(r.uniform(*p["sigma"]))
+        self.scale = 1.0 + float(r.uniform(-p["scale"], p["scale"]))
+        self.off = bool(r.random() < p["off_prob"])
+        self.drop_left, self.hold, self.age, self.has = 0.0, np.zeros(2), float(p["age_cap"]), False
+        self.out = np.array([0.0, 0.0, 0.0, float(p["age_cap"])])
+
+    def __call__(self, s):
+        p, dt, r = self.p, self.dt, self.rng
+        cur = np.array([s["lin_b"][0], s["lin_b"][1], s["ang_b"][2]], float)
+        self.hist = [cur.copy() for _ in range(self.L)] if self.hist is None else [cur] + self.hist[:-1]
+        self.t += 1
+        if not self.off and self.drop_left <= 0 and r.random() < p["drop_rate"] * dt:
+            self.drop_left = float(r.uniform(*p["drop_s"]))
+        else:
+            self.drop_left = max(self.drop_left - dt, 0.0)
+        avail = (not self.off) and self.drop_left <= 0
+        if avail and self.t % self.k == 0:
+            past = self.hist[min(self.delay, self.L - 1)]
+            meas = self.scale * past[:2] + (self.sigma + p["sigma_w"] * abs(past[2])) * r.standard_normal(2)
+            if r.random() < p["spike_prob"]:
+                meas = meas + p["spike_std"] * r.standard_normal(2)
+            self.hold, self.age, self.has = meas, self.delay * dt, True
+        else:
+            self.age += dt
+        self.age = min(self.age, p["age_cap"])
+        valid = self.has and avail and self.age < p["valid_age"]
+        self.out = (np.array([*self.hold, 1.0, self.age]) if valid else np.array([0.0, 0.0, 0.0, p["age_cap"]]))
+        return self.out.copy()
+
+
 class ObsBuilder:
     """Builds the network input from the run's obs groups, in Isaac's exact layout."""
 
-    def __init__(self, env_cfg, groups, obs_delay=0, noise=False, rng=None):
+    def __init__(self, env_cfg, groups, obs_delay=0, noise=False, rng=None, vo="dr"):
         self.items, self.rng, self.obs_delay = [], rng, obs_delay
+        self.vo = None
         for gname in groups:
             terms, hist, corrupt = group_terms(env_cfg, gname)
             for name, t in terms:
                 key = t.get("params", {}).get("source") or t["func"].split(":")[-1]
+                if key == "VoVelocityObs":      # stateful: own simulator, exact (it adds its own delay/noise)
+                    self.vo = VoSim(t["params"]["dr"], rng if rng is not None else np.random.default_rng(), mode=vo)
+                    self.items.append(dict(name=f"{gname}.{name}", fn=lambda c, v=self.vo: v(c["s"]), kind="exact",
+                                           hist=max(hist or t.get("history_length") or 0, 1), std=0.0))
+                    continue
                 if key not in TERM_SOURCES:
                     raise SystemExit(f"관측 항목 '{gname}.{name}' ({t['func']}) 의 MuJoCo 대응이 없음 "
                                      f"→ sim2sim_isaac.py TERM_SOURCES 에 추가")
@@ -259,6 +315,8 @@ class ObsBuilder:
         self.reset()
 
     def reset(self):
+        if self.vo is not None:
+            self.vo.reset()
         for it in self.items:
             it["buf"] = None          # history (oldest first)
             it["lag"] = []            # raw sensor samples for the obs delay
@@ -519,6 +577,8 @@ def main():
     ap.add_argument("--episode-s", type=float, default=None, help="기본: 런의 episode_length_s")
     ap.add_argument("--cmd-resample-s", type=float, nargs=2, default=None, help="기본: 런의 resampling_time_range")
     ap.add_argument("--obs-delay", type=int, default=0, help="센서 관측 지연 [정책 스텝]")
+    ap.add_argument("--vo", choices=("dr", "off"), default="dr",
+                    help="student v3 VO 관측: dr = 학습 VO_DR 모델 (지연·잡음·끊김), off = 항상 무효 (VO 없는 Pi)")
     ap.add_argument("--act-delay", type=int, default=0, help="명령 지연 [정책 스텝]")
     ap.add_argument("--noise", action="store_true", help="런에 enable_corruption 이 켜져 있으면 그 노이즈 σ 적용")
     ap.add_argument("--drive", choices=("isaac", "pi"), default="isaac",
@@ -569,7 +629,7 @@ def main():
     if args.policy != "ik":
         policy = Policy(args.policy, agent_cfg)
         groups = agent_cfg["obs_groups"]["policy"]
-        obs = ObsBuilder(env_cfg, groups, args.obs_delay, args.noise, rng)
+        obs = ObsBuilder(env_cfg, groups, args.obs_delay, args.noise, rng, vo=args.vo)
         probe = obs(dict(cmd=np.zeros(3), s=rover.state(), amap=amap, mu_eff=np.ones(4),
                          act_delay=args.act_delay, obs_delay=args.obs_delay))
         if probe.size != policy.obs_dim or policy.act_dim != amap.dim:

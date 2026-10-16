@@ -1,5 +1,10 @@
 # KSRC 시뮬레이터 · 강화학습 (`sim/`)
 
+> **2026-10-16 현황**: 이 문서의 SB3 경로추종 잔차 학습은 **옛 경로**다. 지금 학습은 Isaac Lab teacher-student Res8
+> ([isaac/ksrc_rover/README.md](isaac/ksrc_rover/README.md), [CLI](isaac/ksrc_rover/CLI.md), 결과는 루트 `HANDOFF.md` §7).
+> `sim/rl/` 에서 지금도 쓰는 것: `terramech.py` (모래 슬립-침하 모델), `mjcf.py` (기본 rev5 모델, `KSRC_MJ_MODEL=rev4` 로 옛 모델),
+> `sim2sim_isaac.py` (Isaac 정책을 MuJoCo 에서 검증, VO 관측 `--vo` 포함), `ik_validate.py`. ROS 비교 주행은 `ros/nav2_isaac.launch.py`.
+
 MuJoCo 물리 + 슬립-침하 흙 모델 위에서, 펌웨어와 **같은 C 기구학**(`firmware/common/`)을
 ctypes 로 호출해 경로추종 잔차 정책을 학습·평가한다. 로버 전체 개요는 [루트 README](../README.md),
 펌웨어 설정은 [firmware/README.md](../firmware/README.md), 전체 학습 명령은 **[CLI.md](CLI.md)**.

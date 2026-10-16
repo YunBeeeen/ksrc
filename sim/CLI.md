@@ -1,5 +1,10 @@
 # 시뮬 · 학습 CLI
 
+> **2026-10-16 현황**: 이 문서의 SB3 경로추종 잔차 학습은 **옛 경로**다. 지금 학습은 Isaac Lab teacher-student Res8
+> ([isaac/ksrc_rover/README.md](isaac/ksrc_rover/README.md), [CLI](isaac/ksrc_rover/CLI.md), 결과는 루트 `HANDOFF.md` §7).
+> `sim/rl/` 에서 지금도 쓰는 것: `terramech.py` (모래 슬립-침하 모델), `mjcf.py` (기본 rev5 모델, `KSRC_MJ_MODEL=rev4` 로 옛 모델),
+> `sim2sim_isaac.py` (Isaac 정책을 MuJoCo 에서 검증, VO 관측 `--vo` 포함), `ik_validate.py`. ROS 비교 주행은 `ros/nav2_isaac.launch.py`.
+
 0~5절의 학습·평가 명령은 `sim/rl/`에서 실행한다. 설명과 학습 결과는 [README.md](README.md),
 ROS/Nav2 런치는 [루트 CLI.md](../CLI.md), 펌웨어는 [firmware/CLI.md](../firmware/CLI.md).
 

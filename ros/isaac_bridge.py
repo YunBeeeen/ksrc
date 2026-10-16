@@ -148,7 +148,7 @@ class Bridge(Node):
         self.policy = self.obs = None
         if a.policy:
             self.policy = Policy(a.policy, agent_cfg)
-            self.obs = ObsBuilder(self.env_cfg, agent_cfg["obs_groups"]["policy"], a.obs_delay, a.noise, self.rng)
+            self.obs = ObsBuilder(self.env_cfg, agent_cfg["obs_groups"]["policy"], a.obs_delay, a.noise, self.rng, vo=a.vo)
         self.rl_on = bool(a.policy) and not a.start_ik
         self.mu_state = {}
         self.cmd = np.zeros(3); self.cmd_t = 0.0
@@ -291,6 +291,8 @@ def main():
     ap.add_argument("--mu-resample-s", type=float, default=3.0)
     ap.add_argument("--friction-duty", type=float, default=53.0, help="바퀴 관절 마찰 [duty] (지면 하중 실측)")
     ap.add_argument("--obs-delay", type=int, default=1)
+    ap.add_argument("--vo", choices=("dr", "off"), default="dr",
+                    help="student v3 VO 관측: dr = 학습 VO_DR 모델, off = 항상 무효 (VO 없는 Pi). VO 없는 정책엔 무관")
     ap.add_argument("--act-delay", type=int, default=1)
     ap.add_argument("--noise", action="store_true", default=True)
     ap.add_argument("--cmd-timeout", type=float, default=0.5)

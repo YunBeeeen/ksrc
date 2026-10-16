@@ -1,4 +1,4 @@
-# pi/ — 라즈베리파이 쪽 코드 (2026-10-14)
+# pi/ — 라즈베리파이 쪽 코드 (2026-10-16)
 
 라파(`ssh pi@raspberrypi.local`, Ubuntu 24.04, 코드 `~/ksrc` = GitHub `YunBeeeen/ksrc` main)에서 돈다.
 Nucleo(STM32)와는 **SPI** 로 이야기한다. USB(UART)는 노트북에서 펌웨어 굽기·설정 명령·sysid 측정할 때만 쓴다.
@@ -15,7 +15,8 @@ Nucleo(STM32)와는 **SPI** 로 이야기한다. USB(UART)는 노트북에서 �
 cd ~/ksrc && git pull
 bash sim/build.sh          # firmware/common C 를 라파용 .so 로 (bringup·정책 실행기가 펌웨어와 같은 C IK 를 씀)
 ```
-필요한 것: python3, numpy, spidev (있음), pyserial (있음). RL 정책 실행에는 torch 가 더 필요 (아직 없음).
+필요한 것: python3, numpy, spidev (있음), pyserial (있음). RL 정책 실행에는 torch 가 더 필요 → venv `~/venv` 에 설치해 `~/venv/bin/python` 으로 실행 (`MEASURE_1016.md` 준비 단계).
+실측 절차: **[MEASURE_1016.md](MEASURE_1016.md)** (바닥·IMU·루프·Pi 부하), **[MEASURE_1017.md](MEASURE_1017.md)** (조향 떨림 S0, 모래 평지·경사 A/B, 유효 견인 계수, VO).
 펌웨어는 **노트북**에서 USB 로 연결해 `firmware/src2026-rover-firmware/build.sh --flash`.
 
 ## 규칙
@@ -38,6 +39,7 @@ bash sim/build.sh          # firmware/common C 를 라파용 .so 로 (bringup·�
 | `spi_timing.py` | 라파 | SPI 교환 주기·왕복 (폴링만) |
 | `imu_check.py` | 라파 | IMU 값 사람이 보기 좋게 (기울기, 누적각) |
 | `udp_spi_bridge.py` | 라파 | PC 조이스틱(UDP 5005) → SPI 중계 |
+| `imu_noise.py` | 노트북 | `run_policy --log` npz 들에서 자이로 바이어스·잡음, 가속도 잡음, 정지 기울기, 진동 주파수 → 시뮬 `STUDENT_NOISE`·`GRAV_ERR` 제안값 (`--out imu_noise.json`) |
 | `sensor_fusion.py` | (라이브러리) | student 관측 계산: 중력 보완 필터, 자이로 바이어스, 바퀴 rad/s. 시뮬 `utils/sensors_torch.py` 와 같은 식 |
 | `sysid_uart.py` | 노트북 (USB) | 모터·서보 측정: `drive` `steer` `steer-small` `pi`(바퀴 PI 벤치) `wcap` `imu`(ICAP 208 Hz) `cap` `raw` → `sysid_logs/` |
 | `sysid_analyze.py` | 노트북 | sysid 결과 분석·판정 (`firmware/MOTOR_MODELING_PLAN.md` §0) |
@@ -47,8 +49,9 @@ bash sim/build.sh          # firmware/common C 를 라파용 .so 로 (bringup·�
 
 | 파일 | 하는 일 |
 |---|---|
-| `run_policy.py` | 내보낸 student(`<p>.pt` + `<p>.json`, `sim/isaac/ksrc_rover/scripts/export_student.py`)를 50 Hz 로. 시작 2 s 정지해 자이로 바이어스 → 텔레메트리 → 관측 → 정책 → SPI 0x02. `--residual-off` (경로만), `--fake`, `--log` |
-| `student_runtime.py` | 관측 조립 (Isaac student 와 같은 항목·순서·이력), 펌웨어 C IK (`FirmwareIK`), 정책 출력 → 잔차 |
+| `run_policy.py` | 내보낸 student(`<p>.pt` + `<p>.json`, `sim/isaac/ksrc_rover/scripts/export_student.py`)를 50 Hz 로. 시작 2 s 정지해 자이로 바이어스 → 텔레메트리 → 관측 → 정책 → SPI 0x02. 시작 때 Nucleo 가 들고 있는 조향각으로 IK 상태 동기화 (`FirmwareIK.sync`). **정지 명령(\|v\|<0.01 m/s, \|ω\|<0.02 rad/s)이면 잔차 0** (서 있을 때 조향 떨림 방지). json 에 `res8_rate_limit` 가 있으면 잔차 변화율 제한도 학습과 같게. `--residual-off` (경로만), `--fake`, `--log` (관측·행동 + 원시 텔레메트리: `host_ns` `cmd` `gyro_dps` `acc_g` `imu_n` `steer_cmd`/`steer_meas`/`steer_load`/`steer_volt` `duty` `wheel_mps` …), `--rt 50 --cpu 3 --gc-off` (루프 지터) |
+| `student_runtime.py` | 관측 조립 (Isaac student 와 같은 항목·순서·이력, student v3 의 `vo` 항 포함 — VO 스트림이 없으면 `[0, 0, 무효, 1.0 s]`), 펌웨어 C IK (`FirmwareIK`), 정책 출력 → 잔차 |
+| `res8_mlp_v1_rc4000.{pt,json}` | **지금 실물에 쓰는 정책** = student v1 (`sim/rl/runs/isaac/2026-10-15_13-06-32_student_mlp_v1_rc4000/model_1000.pt` 를 내보낸 것, teacher rc4000). 시뮬 IK 대비 큰헛돎 −39% |
 | `test_student_runtime.py` | 노트북: C IK == 시뮬 IK, 관측 배치, `--fake` 루프 |
 
 ### `pi/teleop/` — 사람이 모는 텔레옵
@@ -76,8 +79,12 @@ python3 pi/common/bringup.py wpi --wpi on --corr 250
 python3 pi/common/bringup.py sand --vx 0.1 --sec 8 --conds off,on,c100 --sand-reps 2
 # 경사 정지 등 기록
 python3 pi/common/bringup.py log --vx 0 --sec 10 --tag hold12_down
-# RL 정책 (torch 설치 후)
-python3 pi/policy/run_policy.py --policy ~/policies/res8_mlp_h5 --cmd 0.10 0 0 --seconds 5 --log run1.npz
+# RL 정책 (torch venv). 잔차 끄고 경로만 먼저, 그다음 잔차 켬
+RUN="$HOME/venv/bin/python pi/policy/run_policy.py --policy pi/policy/res8_mlp_v1_rc4000 --rt 50 --cpu 3 --gc-off"
+$RUN --residual-off --cmd 0.10 0 0 --seconds 12 --log logs/1016/ik_v010.npz
+$RUN --cmd 0.10 0 0 --seconds 12 --log logs/1016/rl_v010.npz
+# 로그 분석 (노트북)
+python3 pi/common/imu_noise.py sysid_logs/1016/*.npz --out sysid_logs/1016/imu_noise.json
 ```
 
 ## 10-14 실측 (bringup)

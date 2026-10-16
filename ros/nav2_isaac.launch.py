@@ -34,7 +34,7 @@ def setup(ctx):
               "--soil", soil]
     if policy:
         bridge += ["--policy", policy]
-    bridge += ["--gate", g("gate")]
+    bridge += ["--gate", g("gate"), "--vo", g("vo")]
     nav_model, smoother = g("nav_model"), on("smoother")
     if nav_model not in ("rpp", "diff", "omni"):
         raise RuntimeError("nav_model 은 rpp, diff 또는 omni")
@@ -115,8 +115,10 @@ def generate_launch_description():
         DeclareLaunchArgument("mu", default_value="const:0.5", description="const:μ (4바퀴 같음) | uniform:lo,hi | patch"),
         DeclareLaunchArgument("soil", default_value="rigid", description="rigid | sand (MuJoCo 지반역학)"),
         DeclareLaunchArgument("start_ik", default_value="false", description="정책을 불러오되 IK 로 시작"),
+        DeclareLaunchArgument("vo", default_value="dr",
+                              description="student v3 VO 관측: dr = 학습 VO 모델 (지연·잡음·끊김) | off = VO 없음 (Pi 기본)"),
         DeclareLaunchArgument("gate", default_value="new",
-                              description="구동 정렬 게이트: old (10-13 이전 펌웨어, 기본) | new (현 펌웨어·Isaac 학습) | off"),
+                              description="구동 정렬 게이트: new (현 펌웨어·Isaac 학습, 기본) | old (10-13 이전 펌웨어) | off"),
         DeclareLaunchArgument("view", default_value="true", description="MuJoCo 창도 띄움"),
         DeclareLaunchArgument("nav_model", default_value="rpp",
                               description="rpp (RotationShim + Regulated Pure Pursuit, 제안서 구조, 기본) | diff (MPPI DiffDrive) | omni (MPPI 옆걸음: 접기 경계 문제)"),

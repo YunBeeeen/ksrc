@@ -1,6 +1,14 @@
-# KSRC Rover (Isaac) CLI 정리
+# KSRC Rover (Isaac) CLI 정리 (2026-10-16)
 
 서버(hpi-lab) `~/gyusa/ksrc_rover` 기준. 모든 실행은 `run.sh` 래퍼를 통함.
+
+**지금 쓰는 구성 한눈에** (상세·결과는 저장소 루트 `HANDOFF.md` §7):
+- 로버 = rev5, 바퀴 충돌 = 원기둥 → `export KSRC_ROVER_USD=/workspace/assets/usd_rev5cyl/rover.usd` (run.sh 가 컨테이너로 넘김).
+- teacher = `Isaac-KSRC-Rover-Teacher-Res8-v0`, student = `Isaac-KSRC-Rover-Student-MLP-Res8-v0` (history 5).
+- 기본 SET (nolim): `--set SLIP_SQ=(2.5,0.03) --set SLIP_W=0 --set LIN_TRI_V=None --set LIN_TRI_OM=None --set DR_WIDE=True --set DRIVE_MODEL=\"pi\" --set DRIVE_GATE=True --set CMD_ACC_LIN=0.0`
+  + 떨림 대책 (smooth1015): `--set RES8_RATE=0.05 --set RES8_STAND=True --set RES_RATE_W=0.1`
+  + student v3 (VO): `--set STUDENT_VO=True`
+- iter 는 마지막 체크포인트가 50 의 배수가 되게 +1 (처음부터 3001, 증류 1001, model_3000 에서 resume 2001 → model_5000).
 
 ## 0. 배포 (노트북 → 서버)
 ```bash
@@ -19,11 +27,14 @@ bash run.sh <컨테이너내_스크립트경로> <인자...>
 ## 2. 학습 (train)
 ```bash
 bash run.sh /workspace/scripts/train.py \
-  --task Isaac-KSRC-Rover-{Direct8|Res8|Residual3}-v0 \
-  --headless --num_envs 4096 --max_iterations 4000 --seed 42
+  --task Isaac-KSRC-Rover-Teacher-Res8-v0 \
+  --headless --num_envs 4096 --max_iterations 3001 --seed 42 --run_name <이름> $SET
+# student 증류 (teacher 체크포인트에서)
+bash run.sh /workspace/scripts/train.py --task Isaac-KSRC-Rover-Student-MLP-Res8-v0 --headless --num_envs 4096 \
+  --max_iterations 1001 --seed 42 --run_name <이름> --load_run <teacher 런 폴더> --checkpoint model_4000.pt $SET
 ```
-- 스톡 rsl_rl train.py 래퍼. 인자: `--headless`(필수) `--num_envs` `--max_iterations` `--seed` `--resume --load_run <dir> --checkpoint <n>`(이어학습).
-- **env/보상 설정은 CLI 아님** → 아래 CONFIG 상수로.
+- 스톡 rsl_rl train.py 래퍼. 인자: `--headless`(필수) `--num_envs` `--max_iterations` `--seed` `--run_name` `--resume --load_run <dir> --checkpoint <n>`(이어학습) `--set KEY=VALUE`(아래 상수 덮어쓰기).
+- 설정은 아래 CONFIG 상수가 기본값이고, 실험마다 `--set` 으로 바꾼다 (코드 수정·재배포 없이).
 - 산출: `logs/rsl_rl/ksrc_rover_<mode>/<타임스탬프>/model_<iter>.pt` (50마다 저장, 끝에 `model_<N-1>.pt`). **타임스탬프 KST**(10-10 22시 이전 런은 UTC — 이미지에 tzdata 없음, `TZ=KST-9`로 해결).
 
 ## 3. 실험 설정 = 코드 상수 (환경변수 안 씀)
@@ -44,6 +55,13 @@ bash run.sh /workspace/scripts/train.py \
 | `DR_WIDE` | 넓힌 DR (`MU_PATCH_WIDE`·`MASS_SCALE_WIDE`·`COM_RANGE_M_WIDE`·`DR2_WIDE`) | `True` |
 | `DRIVE_GATE` | 펌웨어 구동 정렬 게이트 (조향 60° 넘게 바뀌면 10° 안 들 때까지 바퀴 0, 1.5 s 타임아웃). 기본 켬 = 실기 | `True` |
 | `DRIVE_MODEL` | 바퀴 구동: `isaac`(DCMotor 속도추종, 마찰 없음) / `pi`(펌웨어 WPI + duty 모터 + 기어마찰) / `openloop`(펌웨어 WPI OFF duty + 같은 플랜트) | `"pi"` |
+| `CMD_ACC_LIN` | 학습 명령 변화율 제한 [m/s²]. **0 = 끔 (nolim, 10-14 확정: 제한이 성능 저하 원인)** | `0.0` |
+| `CMD_MODE` | 명령 분포 `uniform`(학습) / `nav`(Nav2 같은 명령, 평가 전용) | `"uniform"` |
+| `RES8_RATE` | Res8 잔차 변화율 제한 [정규화/스텝]. 0.05 = 조향 1.5°/스텝 | `0.05` (smooth) |
+| `RES8_STAND` | 정지 명령(\|v\|<0.01, \|ω\|<0.02)이면 잔차 0. Pi `run_policy`·MuJoCo 브리지도 같게 | `True` (smooth) |
+| `RES_RATE_W` | 정책 원출력 1차 차분² 벌점 (`action_rate_l2`, 탐색 잡음 포함이라 학습 중 가장 큰 벌점 항) | `0.1` (smooth) |
+| `STUDENT_VO` / `VO_DR` | student 관측에 VO 몸체 속도 `[vx, vy, 유효, 경과]` (`mdp/vo.py`, 정답 속도에 지연 60–300 ms·5–17 Hz·잡음 0.02–0.08 m/s·끊김을 입힌 **잠정** 모델) | `True` (v3) |
+| `PRIV_MASK` | 진단: teacher 특권 관측 일부를 0 으로 (`("lin_vel","slip")`) | `()` |
 
 `--set KEY=VALUE` 로 상수를 실행 때 덮어쓸 수 있다 (train.py·eval_log.py, 파이썬 리터럴). 문자열은 `--set DRIVE_MODEL='"pi"'`.
 구동 확인: `bash run.sh /workspace/scripts/drive_check.py --headless --set DRIVE_MODEL='"pi"'` (바퀴 추종오차·duty 포화·몸체 속도오차).
@@ -64,6 +82,15 @@ bash run.sh /workspace/scripts/eval_log.py --task Isaac-KSRC-Rover-Res8-v0 \
 bash run.sh /workspace/scripts/eval_analyze.py <baseline.npz> <policy.npz>   # 짝비교
 bash run.sh /workspace/scripts/compare_all.py                               # logs/eval/*.npz 통합표
 ```
+- **지금 쓰는 평가 프로토콜** (원기둥 rev5): 후보마다 64 env × 800 step, `--wheel-seed 777·1234` × `--seed 0·1·2` = 6 파일 (384 에피소드), 파일명 `logs/eval/cy_<후보>_w<ws>_s<s>.npz`, IK 는 `cy_ik_*`. 평가에도 학습과 같은 `--set` (DRIVE_MODEL·DRIVE_GATE·떨림 대책·STUDENT_VO) 을 준다.
+```bash
+docker run --rm -v $PWD:/workspace -w /workspace ksrc-rover:lab2.3.2-rsl312 /workspace/logs/rank_nl.py cy logs/rank_cy.txt
+#   IK 대비 xy·요·미끄럼 xy·큰헛돎 (bootstrap 95% CI), 넘어짐, 적격(xy ≤+5%, 요 ≤+10%) 안 큰헛돎 순위
+docker run --rm -v $PWD:/workspace -w /workspace ksrc-rover:lab2.3.2-rsl312 /workspace/logs/jit_ana.py
+#   정책 출력(잔차) 흔들림 ±deg/±% 와 실제 조향각 흔들림. 후보 목록은 스크립트 안
+```
+- 주의: rank 표의 `jerk` 는 **실제 조향각** 2차 차분 RMS 라 IK 기동이 지배하고 서보가 걸러 낸 뒤 값이다 → 정책 출력 떨림은 `jit_ana.py` 로 본다.
+- 서버 호스트 python 에는 numpy 가 없어 분석은 위처럼 이미지로 돌린다.
 
 ## 5. detached 실행 + 순차 체인
 ```bash
@@ -138,6 +165,7 @@ bash sim/isaac/ksrc_rover/scripts/chain_sim2sim.sh 32 | tee sim/isaac/ksrc_rover
 | `--episodes` | 32 | 에피소드 수 (= npz 의 N 축) |
 | `--episode-s`, `--cmd-resample-s` | 런에서 | 에피소드 길이, 명령 교체 간격 최소 최대 [s] |
 | `--obs-delay`, `--act-delay` | 0 | 센서 관측·명령 지연 [정책 스텝] (DR 2단계 정책 시험용) |
+| `--vo` | `dr` | student v3 의 VO 관측: `dr` = 학습 `VO_DR` 모델 (numpy 판 `VoSim`), `off` = 항상 무효 (VO 없는 Pi). VO 없는 정책엔 무관 |
 | `--noise` | 꺼짐 | 런이 `enable_corruption` 이면 그 가우시안 σ 를 센서 항목에 적용 |
 | `--mj-dt` | 0.005 | MuJoCo 물리 dt (Isaac 과 같게. 0.002 로 바꿔 수치 민감도 확인 가능) |
 | `--seed` | 777 | 명령·μ·지형·스폰 순서. IK 와 정책이 같은 값이면 짝비교 |
@@ -170,5 +198,15 @@ bash tools/webrtc.sh down                        # 전부 끄고 GPU1 메모리 
 - VPN 이 끊기면 터널·노트북 브리지가 죽는다 → `down` 후 `up`.
 - 재생 컨테이너는 GPU1 에서 약 3 GB 를 더 쓴다(학습과 같이 돌아감). 다 보면 `down`.
 
+## 12. student 내보내기 → 라파
+```bash
+bash run.sh /workspace/scripts/export_student.py --task Isaac-KSRC-Rover-Student-MLP-Res8-v0 \
+  --checkpoint /workspace/logs/rsl_rl/ksrc_rover_teacher_res8/<student 런>/model_1000.pt \
+  --out /workspace/logs/export/res8_mlp_<이름> --headless $SET
+```
+- `<out>.pt` (TorchScript) + `<out>.json` (관측 항목·순서·이력, 잡음, 잔차 범위, `res8_rate_limit`, `res8_stand_mask`) → 저장소 `pi/policy/` 로 복사 → 라파 `run_policy.py --policy pi/policy/<이름>`.
+- json 의 잔차 범위·변화율 제한을 Pi 가 그대로 쓴다. 학습 SET 과 같은 `--set` 을 줘야 json 이 맞다.
+
 ## 태스크 ID
-`Isaac-KSRC-Rover-{Direct8|Res8|Residual3}-v0` (학습), `...-Play-v0` (평가용 소수 env).
+- `Isaac-KSRC-Rover-{Direct8|Res8|Residual3}-v0` (초기 단일 정책), `...-Play-v0` (평가용 소수 env).
+- `Isaac-KSRC-Rover-Teacher-{Res8|…}-v0` (특권 관측 teacher, 현재 주력), `Isaac-KSRC-Rover-Student-{MLP|GRU}-{Res8|…}-v0` (증류 student).

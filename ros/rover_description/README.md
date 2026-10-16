@@ -1,4 +1,38 @@
-# Rover description — 실측 질량·전장·센서 반영
+# Rover description
+
+## ★ 지금 쓰는 모델: rev5 (2026-10-15)
+
+10-14 에 받은 rev5 조립본 URDF (`urdf/rocker_bogie_4wd_rover_rev5_original.urdf`, 원본 그대로) 를
+`scripts/fix_rev5.py` 로 우리 규약에 맞게 고친 것이 정본이다. **원본은 축이 틀려 바로 쓰면 안 된다.**
+
+| 용도 | 파일 |
+|---|---|
+| 정본 URDF (RViz·Nav2 런치) | `rover_rev5.urdf` |
+| Isaac 변환용 (메시 바퀴) | `rover_rev5_isaac.urdf` |
+| **Isaac·MuJoCo 공통 (바퀴 충돌 = 원기둥)** | `rover_rev5_isaac_cyl.urdf` → Isaac `assets/usd_rev5cyl`, MuJoCo `mjcf/rover_rev5.xml` |
+| MuJoCo 모델 생성 | `scripts/make_mjcf_rev5.py` (위 cyl URDF → `mjcf/rover_rev5.xml`, freejoint·IMU site·로커 1:1 등식·센서) |
+| 메시 | `meshes/rev5/` (`base_link_hull.stl` = 몸체 충돌용 볼록 껍질) |
+| 손으로 몰아 보기 | `scripts/teleop_urdf_mujoco.py` (rev4 / rev5orig / rev5, 화면 조이스틱) |
+
+`fix_rev5.py` 가 고치는 것 (기하·질량은 그대로):
+1. 오른쪽 조향 조인트 이름 앞뒤 바뀜 (`rr_steering_joint` 가 앞 오른쪽을 돌렸음)
+2. 조향축 −z → +z (양수 = 위에서 반시계, IK·펌웨어 규약)
+3. 왼쪽 바퀴축 −y → 네 바퀴 모두 +y (양수 = 전진 굴림)
+4. base 원점 18.3 mm 이동 → 로커 회전축 = 모듈 중심 (모듈 x = ±0.102431 m, 펌웨어 IK·`contract.MODULE_XY_M` 과 같음)
+5. 링크 이름을 예전 이름으로 (`*_wheel_link` 등, 코드가 이름으로 찾음)
+6. 조인트 effort/velocity/damping, 조향 한계 ±90°
+7. 바퀴 메시 원점 4.5 mm 보정 (조립 `rev5.stl` 기준 접지 띠 중앙 ±132.5 mm = 조향축)
+
+바퀴: 반지름 **47.503 mm** (URDF 가 정답, 그라우저 14개 끝), 폭 35.4 mm, 타이어 중앙 = 조향축.
+**바퀴 충돌은 원기둥** — 볼록 껍질은 그라우저 끝을 잇는 14각형이 되어 굴림이 덜컹거리고 IK 큰헛돎이 비현실적으로 작게 나온다 (0.0129 vs 원기둥 0.0487).
+MuJoCo 모델 질량 2.397 kg. 로커 한계 ±30° 는 실측 전 가정값 (16일 D14).
+Isaac USD 와 MuJoCo XML 은 같은 cyl URDF 에서 만들어 링크 위치·질량이 일치함을 확인했다 (10-15).
+
+아래는 **rev4 이전 모델** (2026-10-04 `rover.f3z` 기준) 의 기록이다. `sim/rl` 의 옛 MuJoCo 환경은 `KSRC_MJ_MODEL=rev4` 로 이 모델을 쓴다.
+
+---
+
+## (rev4) 실측 질량·전장·센서 반영
 
 2026-10-04 22:28에 받은 `rover.f3z`를 기준으로 만든 ROS 2 URDF와 MuJoCo 모델입니다.
 2026-10-05 수정: 카메라의 35도 하향 자세와 회전 후 무게중심을 반영했습니다.
