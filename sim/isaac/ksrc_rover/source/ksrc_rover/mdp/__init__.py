@@ -2,8 +2,9 @@
 
 from .actions import Direct8ActionCfg, Res8ActionCfg, Residual3ActionCfg
 from .commands import RoverVelocityCommand, RoverVelocityCommandCfg
+from .vo import VoVelocityObs
 from .observations import (base_mass_com, steering_position, steering_velocity, wheel_mu,
-                           wheel_slip, wheel_velocity)
+                           wheel_slip, wheel_velocity, zeros3, zeros4)
 from .rewards import (ActionDiffPenalty, YawAccelPenalty, ang_vel_error_abs,
                       lin_vel_error_abs, slip_magnitude, slip_speed_sq, wheel_slip_ratio,
                       track_ang_vel_linear, track_lin_vel_linear,

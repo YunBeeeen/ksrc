@@ -10,7 +10,7 @@ from isaaclab.utils import configclass
 
 from ksrc_rover.utils.actuators_torch import PWM_MAX, DriveGate, SteerServo, WheelPI, wheel_friction
 from ksrc_rover.utils.contract import (
-    MODULE_NAMES, RES8_STEER_SCALE_RAD, RES8_WHEEL_SCALE, RESIDUAL3_SCALE,
+    MODULE_NAMES, RES8_STEER_SCALE_RAD, RES8_WHEEL_SCALE, RESIDUAL3_SCALE, STAND_V_M_S, STAND_W_RAD_S,
     RESIDUAL_RATE_LIMIT, STEER_LIMIT_RAD, WHEEL_MAX_RAD_S, WHEEL_RADIUS_M,
 )
 from ksrc_rover.utils.ik_torch import BatchedSwerveIK
@@ -180,8 +180,17 @@ class Res8Action(RoverAction):
     """Per-wheel residual on the same nominal IK command."""
 
     def process_actions(self, actions):
-        self._raw[:] = torch.clamp(actions, -1.0, 1.0)
+        a = torch.clamp(actions, -1.0, 1.0)
         nominal = self._env.command_manager.get_command("base_velocity")
+        # 2026-10-15 (떨림): 정지 명령이면 잔차 0 (바퀴가 서 있으면 조향 잔차가 보상에 무관해 정책이 흔들었다),
+        # 그리고 잔차 변화율 제한 |Δa| <= rate_limit / 정책 스텝.  둘 다 Pi run_policy / MuJoCo 브리지가 같게 한다.
+        if self.cfg.stand_mask:
+            stand = (nominal[:, :2].abs() < STAND_V_M_S).all(dim=1) & (nominal[:, 2].abs() < STAND_W_RAD_S)
+            a = torch.where(stand.unsqueeze(1), torch.zeros_like(a), a)
+        if self.cfg.rate_limit > 0:
+            r = float(self.cfg.rate_limit)
+            a = self._raw + (a - self._raw).clamp(-r, r)
+        self._raw[:] = a
         steer, speed_mps = self.ik.compute(nominal)
         target_steer = (steer + self._raw[:, :4] * RES8_STEER_SCALE_RAD).clamp(
             -STEER_LIMIT_RAD, STEER_LIMIT_RAD
@@ -213,6 +222,8 @@ class Residual3ActionCfg(ActionTermCfg):
 class Res8ActionCfg(ActionTermCfg):
     class_type: type = Res8Action
     asset_name: str = "robot"
+    rate_limit: float = 0.0       # max |Δ residual| per policy step (normalized units), 0 = off (rover_env_cfg.RES8_RATE)
+    stand_mask: bool = False      # residual 0 on a standing command (rover_env_cfg.RES8_STAND)
     drive: str = "isaac"          # "isaac" | "pi" (firmware wheel PI) | "openloop" (firmware duty), both + friction
     drive_gate: bool = False      # firmware drive-align gate (hold wheels during big steering changes)
 

@@ -190,7 +190,11 @@ class DriveGate:
 
     SPEED_EPS = 1e-6
 
-    def __init__(self, num_envs: int, device="cpu", trigger_deg=60.0, release_deg=10.0, max_hold_ticks=75):
+    def __init__(self, num_envs: int, device="cpu", trigger_deg=60.0, release_deg=10.0, max_hold_ticks=75,
+                 measured_trigger=True):
+        # measured_trigger=False: 10-13 이전 펌웨어 (main.c 가 pending 일 때만 drive_gate_allow 를 불러
+        # "실제각이 목표에서 60° 넘게 벌어짐" 트리거가 걸리지 않았다).  Isaac 학습은 True (현 펌웨어).
+        self.measured_trigger = bool(measured_trigger)
         f32 = torch.float32
         self.trigger = torch.tensor(math.radians(trigger_deg), dtype=f32)
         self.release = torch.tensor(math.radians(release_deg), dtype=f32)
@@ -221,6 +225,8 @@ class DriveGate:
         # drive_gate_allow (actual_ok = 1)
         max_err = (goal - actual).abs().amax(dim=1)
         meas = ~pending & ~timed_out & driving & (max_err > self.trigger)
+        if not self.measured_trigger:
+            meas = torch.zeros_like(meas)
         self.hold = torch.where(meas, torch.zeros_like(self.hold), self.hold)
         pending = pending | meas
         release = pending & (max_err <= self.release)

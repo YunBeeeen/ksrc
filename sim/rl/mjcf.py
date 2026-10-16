@@ -51,7 +51,10 @@ CORNERS = [  # (이름, 전후부호, 좌우부호).  기구학 코드가 참조
 
 # ros/rover_description = CAD 실측 단일 진실 원천
 PKG = (pathlib.Path(__file__).resolve().parents[2] / "ros" / "rover_description")
-ROVER_XML = PKG / "mjcf" / "rover.xml"
+# 2026-10-15: 기본 = rev5 (최종 설계, 원기둥 바퀴 충돌; ros/rover_description/scripts/make_mjcf_rev5.py).
+#   예전 rev4 CAD 모델은 KSRC_MJ_MODEL=rev4.
+import os as _os
+ROVER_XML = PKG / "mjcf" / ("rover.xml" if _os.environ.get("KSRC_MJ_MODEL", "rev5") == "rev4" else "rover_rev5.xml")
 MESH_DIR = PKG / "meshes"
 
 # CAD 이름 -> 기존 sim/rl 이름.  env.py(st_/wh_/a_st_/a_wh_/s_quat/s_gyro/s_acc/
@@ -169,7 +172,9 @@ def build(c: RoverCfg, terrain: str = "plane", hfield_n: int = 384,
         s.set("armature", "0.002")
     for side in ("l", "r"):
         j = _find_joint(root, f"rock_{side}")
-        j.set("range", f"{-c.rocker_lim:.4f} {c.rocker_lim:.4f}")
+        # rev5: URDF/Isaac 의 ±30° 를 그대로 (config.rocker_lim 25.2° 는 rev4 시절 미측정 가정값)
+        lim = 0.5236 if ROVER_XML.name == "rover_rev5.xml" else c.rocker_lim
+        j.set("range", f"{-lim:.4f} {lim:.4f}")
         j.set("damping", "0.05")
         j.set("armature", "0.001")
 

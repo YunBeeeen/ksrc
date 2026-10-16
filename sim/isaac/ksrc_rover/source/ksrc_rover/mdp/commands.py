@@ -29,6 +29,13 @@ import torch
 from isaaclab.envs.mdp.commands import UniformVelocityCommand, UniformVelocityCommandCfg
 from isaaclab.utils import configclass
 
+# Nav2-like command mix (mode="nav", 10-15, evaluation): Regulated Pure Pursuit outputs (v, kappa) with
+# omega = v*kappa and no vy; it slows on curves and rotates in place to a waypoint heading.  Mostly forward
+# at 0.08-0.25 m/s, half nearly straight (|kappa| <= 0.3 1/m), half curving (radius 0.67-3.3 m), plus
+# in-place rotations, short back-ups and a few small sideways corrections.  Still smoothed by the rate limit.
+NAV = dict(v=(0.08, 0.25), straight_prob=0.5, kappa_straight=0.3, kappa_turn=(0.3, 1.5),
+           rotate_prob=0.10, w_rotate=(0.3, 0.6), reverse_prob=0.05, v_reverse=(0.05, 0.12),
+           crab_prob=0.05, vy_crab=(0.03, 0.08))
 TRANSIENT_S = 1.0
 SLICK_MU = 0.2
 _KEYS = ("err_xy", "err_yaw", "err_xy_steady", "err_yaw_steady", "err_xy_slick", "err_yaw_slick",
@@ -78,11 +85,36 @@ class RoverVelocityCommand(UniformVelocityCommand):
 
     def _resample_command(self, env_ids):
         super()._resample_command(env_ids)
+        if self.cfg.mode == "nav":
+            self._sample_nav(env_ids)
+        elif self.cfg.mode != "uniform":
+            raise ValueError(f"unknown command mode {self.cfg.mode!r}")
         self._t_cmd[env_ids] = 0.0
         if self.cfg.acc_lin > 0:
             self._target[env_ids] = self.vel_command_b[env_ids]
             self._abrupt[env_ids] = torch.rand(len(env_ids), device=self.device) < self.cfg.abrupt_prob
             self.vel_command_b[env_ids] = self._out[env_ids]     # keep the current command; ramp in _update
+
+    def _sample_nav(self, env_ids):
+        """Nav2 RPP-like command (v, kappa) -> (vx, 0, v*kappa); see NAV for the mix."""
+        n, dev = len(env_ids), self.device
+        u = lambda lo, hi: lo + (hi - lo) * torch.rand(n, device=dev)
+        sign = lambda: torch.where(torch.rand(n, device=dev) < 0.5, -1.0, 1.0)
+        v = u(*NAV["v"])
+        straight = torch.rand(n, device=dev) < NAV["straight_prob"]
+        kappa = torch.where(straight, u(-NAV["kappa_straight"], NAV["kappa_straight"]), sign() * u(*NAV["kappa_turn"]))
+        cmd = torch.stack((v, torch.zeros_like(v), v * kappa), dim=1)
+        r = torch.rand(n, device=dev)
+        p_rot, p_rev, p_crab = NAV["rotate_prob"], NAV["reverse_prob"], NAV["crab_prob"]
+        rot = r < p_rot                                          # rotate to heading at a waypoint
+        rev = (r >= p_rot) & (r < p_rot + p_rev)                 # short back-up (recovery)
+        crab = (r >= p_rot + p_rev) & (r < p_rot + p_rev + p_crab)   # small sideways correction
+        cmd[rot] = torch.stack((torch.zeros(n, device=dev), torch.zeros(n, device=dev),
+                                sign() * u(*NAV["w_rotate"])), dim=1)[rot]
+        cmd[rev, 0] = -u(*NAV["v_reverse"])[rev]
+        cmd[rev, 2] = 0.0
+        cmd[crab, 1] = (sign() * u(*NAV["vy_crab"]))[crab]
+        self.vel_command_b[env_ids] = cmd
 
     def _update_command(self):
         if self.cfg.acc_lin <= 0:
@@ -136,3 +168,4 @@ class RoverVelocityCommandCfg(UniformVelocityCommandCfg):
     acc_ang: float = 0.0          # [rad/s^2]
     abrupt_prob: float = 0.0      # fraction of resamples that still jump at once
     dir_rate: float = 1.5         # [rad/s] max turn rate of the xy command direction (servo ~1.8 rad/s avg over 90 deg)
+    mode: str = "uniform"         # "uniform" (ranges) or "nav" (Nav2-like mix, NAV above)

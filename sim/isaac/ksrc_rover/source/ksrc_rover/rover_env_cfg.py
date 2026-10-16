@@ -60,6 +60,9 @@ CMD_ACC_LIN  = 0.5             # [m/s^2]  0.25 -> -0.25 반전에 1 s
 CMD_ACC_ANG  = 2.0             # [rad/s^2] -1 -> +1 에 1 s
 CMD_ABRUPT_P = 0.2
 CMD_DIR_RATE = 1.5             # [rad/s] 명령 방향 회전 한계 (86 °/s, 서보 90° 0.87 s 보다 조금 느리게)
+# 명령 분포 (10-15): "uniform" = 위 ranges 균등 (학습 기본) / "nav" = Nav2 RPP 처럼 전진 위주 (v, κ), vy 0,
+#   가끔 제자리 회전·후진·옆걸음.  평가 전용으로 쓴다 (--set CMD_MODE="nav").  세부는 mdp/commands.py NAV.
+CMD_MODE     = "uniform"
 EPISODE_S    = 16.0
 # DR 단계. 1 = μ·지형·질량·명령(위). 2 = + 모터·서보·지연·센서노이즈(아래 DR2). 관측 크기는 같아서
 # 1단계 teacher 체크포인트를 2단계로 이어 학습(--resume) 할 수 있다.
@@ -106,6 +109,12 @@ GRAV_ERR_STUDENT = True       # student 중력 관측에 (DR_STAGE>=2)
 GRAV_ERR_POLICY = False       # teacher 'policy' 그룹 중력에도 -- 민감도 평가용 (--set GRAV_ERR_POLICY=True)
 # student 입력 기록 길이 [정책 스텝]. MLP student 5(0.1s)/25(0.5s), GRU student 는 1.
 STUDENT_HISTORY = 5
+# student 관측에 VO 몸체 속도 (10-15, 잠정·비관적 모델, mdp/vo.py). --set STUDENT_VO=True 로 켬 (v3).
+#   실측(16/17일) 전이라 범위를 넓게: 5-17 Hz, 지연 60-300 ms, 잡음 0.02-0.08 m/s, 30% 에피소드는 VO 없음.
+STUDENT_VO = False
+VO_DR = dict(rate_steps=(3, 10), delay_steps=(3, 15), sigma=(0.02, 0.08), sigma_w=0.03, scale=0.05,
+             spike_prob=0.01, spike_std=0.3, off_prob=0.3, drop_rate=0.1, drop_s=(0.5, 2.0),
+             valid_age=0.5, age_cap=1.0)
 # 리셋 생성 높이 [m] (base_link, 타일 중심 지면 기준). URDF: 바퀴 바닥 = base_link −0.1618.
 # 0.15 였을 땐 평지서도 1.2cm 박혀 리셋 직후 튕겨 ~50% 전복(2026-10-10 진단).
 # 0.21 = 0.1618 + 경사여유 0.175·tan10°(0.031) + 0.01 + 요철(narrow). wide(20°) 는 0.24.
@@ -143,7 +152,15 @@ RATE_STEER_W = 1.5            # 조향 명령 1차 차분² (변화량)
 RATE_WHEEL_W = 0.6            # 바퀴 명령 1차 차분²
 JERK_STEER_W = 0.9            # 조향 명령 2차 차분² (떨림. 등속 램프는 0)
 JERK_WHEEL_W = 0.3            # 바퀴 명령 2차 차분²
+# 2026-10-15 떨림 대책 (teacher 재학습): 잔차 변화율 제한 [정규화 단위/스텝], 정지 명령 잔차 0, 정책 출력 변화 벌점.
+#   0.05/스텝 = 조향 1.5°/스텝 (±30° 끝까지 0.4 s), 바퀴 배율 3%/스텝.  기본은 꺼짐 (예전 런 재현).
+RES8_RATE    = 0.0
+RES8_STAND   = False
+RES_RATE_W   = 0.0            # 정책 원출력 1차 차분² 벌점 (lab action_rate_l2). RATE_* 와 별개로 켜진다
 YAW_ACC_W    = 0.001          # 몸체 yaw 각가속도². 버그수정 env 서 Direct8 6.9 vs IK 2.4 rad/s² → 정책 기인
+# 진단용 (10-15): teacher 특권 관측 중 일부를 0 으로 가린다. 평가에서 --set PRIV_MASK=("lin_vel","slip") 처럼.
+#   teacher 이득이 참 속도 정보에서 오는지 보려는 것. 학습에는 쓰지 않는다 (기본 () = 그대로).
+PRIV_MASK    = ()
 # ===================================================================
 
 # scripts/train.py --set KEY=VALUE 덮어쓰기 (KSRC_SET 환경변수로 전달됨, 파이썬 리터럴).
@@ -242,9 +259,9 @@ class ObservationsCfg:
     class PrivilegedCfg(ObsGroup):
         # Teacher-only ground truth (22D). Student never sees this group; it must infer
         # these from its history. No noise: they are the answers, not sensor readings.
-        lin_vel = ObsTerm(func=lab_mdp.base_lin_vel)      # true body velocity (3)
+        lin_vel = ObsTerm(func=mdp.zeros3 if "lin_vel" in PRIV_MASK else lab_mdp.base_lin_vel)  # true body velocity (3)
         mu = ObsTerm(func=mdp.wheel_mu)                   # static μ per wheel (4)
-        slip = ObsTerm(func=mdp.wheel_slip)               # signed slip per wheel (4)
+        slip = ObsTerm(func=mdp.zeros4 if "slip" in PRIV_MASK else mdp.wheel_slip)  # signed slip per wheel (4)
         mass_com = ObsTerm(func=mdp.base_mass_com)        # mass scale, CoM offset (4)
         dr = ObsTerm(func=mdp.dr_params)                  # stage-2 DR values, nominal in stage 1 (7)
 
@@ -276,6 +293,9 @@ class ObservationsCfg:
         wheel_rate = ObsTerm(func=mdp.DelayedObs, params={"source": "wheel_vel_enc", "asset_cfg": SceneEntityCfg(
             "robot", joint_names=WHEEL_JOINTS, preserve_order=True)})
 
+        if STUDENT_VO:
+            vo = ObsTerm(func=mdp.VoVelocityObs, params={"dr": VO_DR})   # [vx, vy, valid, age]
+
         def __post_init__(self):
             super().__post_init__()
             self.history_length = STUDENT_HISTORY
@@ -305,6 +325,7 @@ class RewardsCfg:
     jerk_steer = None
     jerk_wheel = None
     yaw_acc = None
+    res_rate = None
 
 
 @configclass
@@ -375,6 +396,7 @@ class RoverBaseEnvCfg(ManagerBasedRLEnvCfg):
         self.commands.base_velocity.acc_ang = CMD_ACC_ANG
         self.commands.base_velocity.abrupt_prob = CMD_ABRUPT_P
         self.commands.base_velocity.dir_rate = CMD_DIR_RATE
+        self.commands.base_velocity.mode = CMD_MODE
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
         # rough_slope(318k tri) 는 여러 PhysX GPU 버퍼를 넘긴다(contact 드롭=물리 부정확).
@@ -417,6 +439,9 @@ class RoverBaseEnvCfg(ManagerBasedRLEnvCfg):
             init_state=self.scene.robot.init_state.replace(pos=(0.0, 0.0, SPAWN_Z)))
         self.actions.rover.drive = DRIVE_MODEL
         self.actions.rover.drive_gate = DRIVE_GATE
+        if hasattr(self.actions.rover, "rate_limit"):
+            self.actions.rover.rate_limit = RES8_RATE
+            self.actions.rover.stand_mask = RES8_STAND
         if DRIVE_DAMPING is not None:
             acts = dict(self.scene.robot.actuators)
             acts["drive"] = acts["drive"].replace(damping=DRIVE_DAMPING)
@@ -474,6 +499,8 @@ class RoverBaseEnvCfg(ManagerBasedRLEnvCfg):
             if w > 0:
                 setattr(self.rewards, name, RewTerm(func=mdp.ActionDiffPenalty, weight=-w,
                                                     params={"part": part, "order": order}))
+        if RES_RATE_W > 0:
+            self.rewards.res_rate = RewTerm(func=lab_mdp.action_rate_l2, weight=-RES_RATE_W)
         if YAW_ACC_W > 0:
             self.rewards.yaw_acc = RewTerm(func=mdp.YawAccelPenalty, weight=-YAW_ACC_W)
 

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+STAND_V, STAND_W = 0.01, 0.02      # [m/s], [rad/s] 이하면 정지 명령 -> 잔차 0 (ros/isaac_bridge.py 와 같은 값)
 from student_runtime import FirmwareIK, StudentObs, action_to_residual, applied_for_obs, nl
 
 
@@ -38,7 +39,7 @@ class FakeLink:
     def _tlm(self):
         self.t += 20
         return {"flags": nl.TLM_FLAG_IMU_VALID | nl.TLM_FLAG_RES_ACTIVE, "t_ms": self.t, "tick": self.t // 20 & 255,
-                "gyro_dps": (0.0, 0.0, 0.0), "acc_g": (0.0, 0.0, 1.0), "steer_meas_rad": tuple(self.goal),
+                "gyro_dps": (0.0, 0.0, 0.0), "acc_g": (0.0, 0.0, 1.0), "steer_meas_rad": tuple(self.goal), "steer_cmd_rad": tuple(self.goal),
                 "steer_speed": (0, 0, 0, 0), "wheel_mps": tuple(self.speed), "duty": (0, 0, 0, 0)}
 
     def exchange(self, vx, vy, w, poll_only=False):
@@ -92,6 +93,9 @@ def main():
         for _ in range(3):
             pol(x0) if h is None else pol(x0, h)
     dt = float(meta.get("control_dt_s", 0.02))
+    rate = float(meta.get("res8_rate_limit", 0.0))
+    a_prev = np.zeros(8, np.float32)
+    print(f"[run] 잔차 후처리: 변화율 제한 {rate or '없음'}/스텝, 정지 명령 잔차 0", flush=True)
     obs_b = StudentObs(meta, dt)
     ik = FirmwareIK()
     link = FakeLink() if args.fake else nl.SpiLink()
@@ -109,9 +113,26 @@ def main():
     bias = np.mean(g, 0)
     print(f"[run] 자이로 바이어스 {np.round(bias, 4)} rad/s ({len(g)} 샘플)", flush=True)
 
+    # 2) Pi IK starts from the angles the Nucleo already holds (else applied_targets is wrong until the first move)
+    t_sync = tlm
+    for _ in range(10):
+        if t_sync is not None and "steer_cmd_rad" in t_sync:
+            break
+        t_sync = link.exchange(0.0, 0.0, 0.0, poll_only=True)
+        time.sleep(dt)
+    if t_sync is not None and "steer_cmd_rad" in t_sync:
+        ik.sync(t_sync["steer_cmd_rad"])
+        print(f"[run] IK 시작 조향각 = Nucleo 유지값 {np.round(np.degrees(t_sync['steer_cmd_rad']), 1)} deg", flush=True)
+    else:
+        print("[run] 경고: steer_cmd_rad 못 받음 -- IK 상태 0 에서 시작 (첫 움직임 전까지 applied_targets 틀릴 수 있음)", flush=True)
+
     vx, vy, w = args.cmd
+    tlm_ns = time.time_ns()
     applied = applied_for_obs(*ik.step(0.0, 0.0, 0.0), None)
-    log = {k: [] for k in ("t_ms", "obs", "action", "flags", "duty", "wheel_mps", "steer_meas", "steer_cmd")}
+    # 원시 텔레메트리도 저장 (10-15): 속도 추정기·duty–슬립 관계를 17일 로그로 오프라인 재생해 설계하려고.
+    #   host_ns = 텔레메트리를 받은 Pi 시각 (time.time_ns, 카메라·ORB 기록과 맞추는 기준), cmd = 보낸 (vx, vy, w)
+    log = {k: [] for k in ("t_ms", "host_ns", "cmd", "obs", "action", "flags", "duty", "wheel_mps", "steer_meas", "steer_cmd",
+                           "steer_speed", "steer_load", "steer_volt", "gyro_dps", "acc_g", "imu_n", "wpi_corr", "tick")}
     n_bad = 0
     t_start, t_comp, n_late, n_resync = [], [], 0, 0
     if args.gc_off:
@@ -127,6 +148,7 @@ def main():
             if tlm is None:
                 n_bad += 1
                 tlm = link.exchange(vx, vy, w, poll_only=True)
+                tlm_ns = time.time_ns()
                 continue
             obs = obs_b.push(obs_b.frame((vx, vy, w), tlm, bias, applied))
             with torch.no_grad():
@@ -136,16 +158,29 @@ def main():
                 else:
                     a, h = pol(x, h)
             a = a[0].numpy()
+            # 학습과 같은 잔차 후처리 (10-15, json res8_*): 정지 명령이면 0, 그리고 변화율 제한.
+            # 옛 정책(json 에 없음)도 정지 명령 잔차 0 은 적용 (서 있는 동안 조향 떨림 방지).
+            standing = abs(vx) < STAND_V and abs(vy) < STAND_V and abs(w) < STAND_W
+            if standing:
+                a = np.zeros_like(a)
+            if rate > 0:
+                a = a_prev + np.clip(a - a_prev, -rate, rate)
+            a_prev = a.copy()
             d_steer, gain = action_to_residual(a)
             if args.residual_off:
                 d_steer, gain = np.zeros(4, np.float32), np.ones(4, np.float32)
             tlm_next = link.exchange_res(vx, vy, w, d_steer.tolist(), gain.tolist())
+            tlm_next_ns = time.time_ns()
             t_comp.append(time.monotonic() - t0)
             # what the Nucleo applies from this command on = the next frame's applied_targets
             applied = applied_for_obs(*ik.step(vx, vy, w, d_steer, gain), tlm_next)
-            for key, v in (("t_ms", tlm["t_ms"]), ("obs", obs[0]), ("action", a), ("flags", tlm["flags"]),
-                           ("duty", tlm["duty"]), ("wheel_mps", tlm["wheel_mps"]),
-                           ("steer_meas", tlm["steer_meas_rad"]), ("steer_cmd", tlm.get("steer_cmd_rad", (0,) * 4))):
+            for key, v in (("t_ms", tlm["t_ms"]), ("host_ns", tlm_ns), ("cmd", (vx, vy, w)), ("obs", obs[0]), ("action", a),
+                           ("flags", tlm["flags"]), ("duty", tlm["duty"]), ("wheel_mps", tlm["wheel_mps"]),
+                           ("steer_meas", tlm["steer_meas_rad"]), ("steer_cmd", tlm.get("steer_cmd_rad", (0,) * 4)),
+                           ("steer_speed", tlm.get("steer_speed", (0,) * 4)), ("steer_load", tlm.get("steer_load", (0,) * 4)),
+                           ("steer_volt", tlm.get("steer_volt", (0,) * 4)), ("gyro_dps", tlm.get("gyro_dps", (0,) * 3)),
+                           ("acc_g", tlm.get("acc_g", (0,) * 3)), ("imu_n", tlm.get("imu_n", -1)),
+                           ("wpi_corr", tlm.get("wpi_corr", -1)), ("tick", tlm.get("tick", -1))):
                 log[key].append(np.asarray(v))
             if k % 25 == 0:
                 fl = tlm["flags"]
@@ -154,7 +189,7 @@ def main():
                       f"게이트 {'보류' if fl & nl.TLM_FLAG_GATE_PENDING else '-'} "
                       f"주기 최대 {win.max():.1f} ms  계산 {t_comp[-1] * 1000:.1f} ms  "
                       f"a={np.round(a, 2)} duty={tlm['duty']}", flush=True)
-            tlm = tlm_next
+            tlm, tlm_ns = tlm_next, tlm_next_ns
             next_t += dt
             if time.monotonic() - next_t > dt:      # 한 주기 넘게 밀렸으면 몰아서 따라잡지 않고 다시 맞춤
                 next_t = time.monotonic()

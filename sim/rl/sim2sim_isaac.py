@@ -59,12 +59,12 @@ from config import RoverCfg  # noqa: E402
 from mjcf import build  # noqa: E402
 from terramech import PRESETS, Terramechanics, sample_terrain  # noqa: E402
 from ksrc_rover.utils.actuators_torch import (  # noqa: E402
-    PWM_MAX, SteerServo, WheelPI, drive_torque, encoder_speed, encoder_ticks)
+    PWM_MAX, DriveGate, SteerServo, WheelPI, drive_torque, encoder_speed, encoder_ticks)
 from ksrc_rover.utils.sensors_torch import GravityFilter, servo_angle  # noqa: E402
 from ksrc_rover.utils.contract import (  # noqa: E402
     CONTROL_DT_S, DRIVE_ARMATURE, DRIVE_EFFORT_NM, MODULE_XY_M, RES8_STEER_SCALE_RAD, RES8_WHEEL_SCALE,
     RESIDUAL3_SCALE, RESIDUAL_RATE_LIMIT, STEER_EFFORT_NM, STEER_LIMIT_RAD, WHEEL_MAX_RAD_S,
-    WHEEL_RADIUS_M)
+    WHEEL_RADIUS_M, STAND_V_M_S, STAND_W_RAD_S)
 from ksrc_rover.utils.ik_torch import BatchedSwerveIK  # noqa: E402
 
 CORNERS = ("fl", "fr", "rl", "rr")          # Isaac module order
@@ -155,8 +155,9 @@ class Policy:
 
 # ---------------------------------------------------------------- actions (mdp/actions.py)
 class ActionMap:
-    def __init__(self, mode, act_delay=0):
+    def __init__(self, mode, act_delay=0, rate_limit=0.0, stand_mask=False):
         self.mode = mode
+        self.rate_limit, self.stand_mask = float(rate_limit), bool(stand_mask)   # Res8 (mdp/actions.py, 10-15)
         self.dim = 3 if mode == "Residual3" else 8
         self.ik = BatchedSwerveIK(1, "cpu")
         self.act_delay = act_delay
@@ -179,6 +180,10 @@ class ActionMap:
             self.raw = a
             p = np.concatenate((a[:4] * STEER_LIMIT_RAD, a[4:] * WHEEL_MAX_RAD_S))
         elif self.mode == "Res8":
+            if self.stand_mask and abs(cmd[0]) < STAND_V_M_S and abs(cmd[1]) < STAND_V_M_S and abs(cmd[2]) < STAND_W_RAD_S:
+                a = np.zeros_like(a)
+            if self.rate_limit > 0:
+                a = self.raw + np.clip(a - self.raw, -self.rate_limit, self.rate_limit)
             self.raw = a
             steer, mps = self._ik(cmd)
             s = np.clip(steer + a[:4] * RES8_STEER_SCALE_RAD, -STEER_LIMIT_RAD, STEER_LIMIT_RAD)
@@ -215,12 +220,14 @@ TERM_SOURCES = {
     "steering_position": ("sensor", lambda c: c["s"]["steer_obs"]), "steer_pos": ("sensor", lambda c: c["s"]["steer_obs"]),
     "steering_velocity": ("sensor", lambda c: c["s"]["steer_v"]), "steer_vel": ("sensor", lambda c: c["s"]["steer_v"]),
     "wheel_velocity": ("sensor", lambda c: c["s"]["wheel_w_obs"]), "wheel_vel": ("sensor", lambda c: c["s"]["wheel_w_obs"]),
-    "applied_targets": ("exact", lambda c: c["amap"].processed),
+    # 10-14: Isaac applied_targets = what the policy just commanded (IK + residual, before delay and gate)
+    "applied_targets": ("exact", lambda c: c["amap"].target),
     # student, computed as on the real rover (mdp/dr.py *_src, utils/sensors_torch.py)
     "steer_pos_servo": ("sensor", lambda c: c["s"]["steer_servo"]),
     "steer_vel_servo": ("sensor", lambda c: c["s"]["steer_v_servo"]),
     "wheel_vel_enc": ("sensor", lambda c: c["s"]["wheel_w_enc"]),
     "gravity_imu": ("sensor", lambda c: c["s"]["grav_imu"]),
+    "gyro_imu": ("sensor", lambda c: c["s"]["gyro_imu"]),     # 10-14: IMU mean over the period (dr._GyroImuSrc)
     # privileged (teacher)
     "base_lin_vel": ("exact", lambda c: c["s"]["lin_b"]),
     "wheel_mu": ("exact", lambda c: c["mu_eff"]),
@@ -321,7 +328,8 @@ class WheelScaledTerramech(Terramechanics):
 
 # ---------------------------------------------------------------- MuJoCo rover
 class MjRover:
-    def __init__(self, scenario, mj_dt, rng, visual=False, drive="isaac", sensors="ideal", wheel_friction_duty=0.0):
+    def __init__(self, scenario, mj_dt, rng, visual=False, drive="isaac", sensors="ideal", wheel_friction_duty=0.0,
+                 gate="new"):
         self.scenario, self.rng = scenario, rng
         self.drive, self.sensors = drive, sensors
         self.cfg = RoverCfg()
@@ -351,6 +359,13 @@ class MjRover:
         m.actuator_forcerange[self.steer_a] = [-STEER_EFFORT_NM, STEER_EFFORT_NM]   # 12 V C018 (config.py 1.912)
         self.servo = SteerServo(1, mj_dt)
         self.pi = WheelPI(1)
+        # firmware drive align gate: "old" = 10-13 이전 (목표각 급변만 트리거), "new" = 현 펌웨어·Isaac 학습
+        # (실측 트리거 포함), "off" = 없음
+        gate = {True: "new", False: "off"}.get(gate, gate)
+        self.gate_on = gate != "off"
+        self.gate = DriveGate(1, measured_trigger=(gate == "new"))
+        self.gate_hold = False
+        self.gyro_imu = np.zeros(3)
         self.ticks_prev, self.wheel_w_enc, self.duty = np.zeros(4), np.zeros(4), np.zeros(4)
         self.q_prev = self.v_prev = None
         self.gfilt = GravityFilter(1, CONTROL_DT_S)
@@ -394,6 +409,9 @@ class MjRover:
         mujoco.mj_forward(m, d)
         self.servo.reset()
         self.pi.reset()
+        self.gate.reset()
+        self.gate_hold = False
+        self.gyro_imu = np.zeros(3)
         self.duty = np.zeros(4)
         self.ticks_prev = self._ticks()
         self.wheel_w_enc = np.zeros(4)
@@ -422,6 +440,7 @@ class MjRover:
 
     def _step_gravity(self):
         gyro, acc = self._imu()
+        self.gyro_imu = gyro.copy()
         self.grav_imu = self.gfilt.step(torch.as_tensor(gyro[None], dtype=torch.float32),
                                         torch.as_tensor(acc[None], dtype=torch.float32))[0].numpy().astype(float)
 
@@ -433,6 +452,12 @@ class MjRover:
         m, d = self.m, self.d
         goal = torch.as_tensor(processed[None, :4], dtype=torch.float32)
         w_t = processed[4:]
+        if self.gate_on:             # Nucleo: IK (+ residual) -> gate (on the servo's own reading) -> drive
+            actual = torch.as_tensor(d.qpos[self.steer_q][None], dtype=torch.float32)
+            allow = bool(self.gate.step(goal, torch.as_tensor(w_t[None], dtype=torch.float32), actual)[0])
+            self.gate_hold = not allow
+            if not allow:
+                w_t = np.zeros(4)
         if self.drive == "pi":       # firmware: once per control period, on the encoder speed of the last period
             self.duty = self.pi.step(torch.as_tensor(w_t[None], dtype=torch.float32),
                                      torch.as_tensor(self.wheel_w_enc[None], dtype=torch.float32))[0].numpy()
@@ -473,7 +498,7 @@ class MjRover:
                     steer_obs=steer_obs, wheel_w_obs=wheel_w_obs,
                     steer_servo=servo_angle(torch.as_tensor(steer)).numpy(),
                     steer_v_servo=servo_angle(torch.as_tensor(d.qvel[self.steer_v])).numpy(),
-                    wheel_w_enc=self.wheel_w_enc.copy(), grav_imu=self.grav_imu.copy())
+                    wheel_w_enc=self.wheel_w_enc.copy(), grav_imu=self.grav_imu.copy(), gyro_imu=self.gyro_imu.copy())
 
     def mu_effective(self):
         """μ the wheels actually have: the set μ, or terramech's peak μ_max × factor."""
@@ -502,6 +527,8 @@ def main():
                     help="바퀴 관절 쿨롱 마찰 [duty 환산] (실측 운동 ~5, 기동 35-52). 기본 0 = 학습과 같음")
     ap.add_argument("--sensors", choices=("ideal", "real"), default="ideal",
                     help="real = 바퀴 속도를 엔코더 20 ms 차분으로, 조향각을 서보 4096 격자로")
+    ap.add_argument("--gate", choices=("old", "new", "off"), default="new",
+                    help="구동 정렬 게이트: old = 10-13 이전 펌웨어 (기본, 사용자 10-15) / new = 현 펌웨어·Isaac / off")
     ap.add_argument("--mj-dt", type=float, default=0.005)
     ap.add_argument("--seed", type=int, default=777)
     ap.add_argument("--out", default=None, help="npz 경로. --view 면 생략 가능(저장 안 함)")
@@ -530,13 +557,14 @@ def main():
     if abs(args.mj_dt - 0.005) > 1e-9:
         print("[sim2sim] 경고: 서보 모델은 물리 스텝마다 돈다 -- Isaac(0.005)과 다르면 지연 틱 수가 바뀐다", flush=True)
     rover = MjRover(args.scenario, args.mj_dt, rng, visual=args.view, drive=args.drive, sensors=args.sensors,
-                    wheel_friction_duty=args.wheel_friction_duty)
+                    wheel_friction_duty=args.wheel_friction_duty, gate=args.gate)
     viewer = None
     if args.view:
         import mujoco.viewer
         viewer = mujoco.viewer.launch_passive(rover.m, rover.d)
         viewer.cam.distance, viewer.cam.elevation = 2.0, -25
-    amap = ActionMap(action, args.act_delay)
+    rov = ((env_cfg or {}).get("actions", {}) or {}).get("rover", {}) or {}
+    amap = ActionMap(action, args.act_delay, rov.get("rate_limit", 0.0), rov.get("stand_mask", False))
     policy, obs = None, None
     if args.policy != "ik":
         policy = Policy(args.policy, agent_cfg)

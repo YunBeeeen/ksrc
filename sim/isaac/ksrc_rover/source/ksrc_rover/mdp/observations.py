@@ -23,6 +23,17 @@ def applied_targets(env):
     return env.action_manager.get_term("rover").commanded_targets
 
 
+def zeros3(env):
+    """Masked privileged term (rover_env_cfg.PRIV_MASK, diagnostics only)."""
+    import torch
+    return torch.zeros(env.num_envs, 3, device=env.device)
+
+
+def zeros4(env):
+    import torch
+    return torch.zeros(env.num_envs, 4, device=env.device)
+
+
 # --- Privileged (teacher-only) observations ------------------------------------
 # Ground truth the real robot cannot measure. Only the "privileged" group carries
 # these; the teacher actor/critic read it, the student never does (it must infer

@@ -109,6 +109,11 @@ meta = {
     "history_order": "oldest first per term",
     "action_dim": env.unwrapped.action_manager.total_action_dim,
     "control_dt_s": cfg.sim.dt * cfg.decimation,
+    # 2026-10-15: 학습 때 잔차 후처리 (Pi run_policy 가 같게 적용). 없는 옛 json 은 0 / false = 예전 동작
+    "res8_rate_limit": float(getattr(rcfg, "RES8_RATE", 0.0)),
+    "res8_stand_mask": bool(getattr(rcfg, "RES8_STAND", False)),
+    "res8_steer_scale_rad": float(__import__("ksrc_rover.utils.contract", fromlist=["x"]).RES8_STEER_SCALE_RAD),
+    "res8_wheel_scale": float(__import__("ksrc_rover.utils.contract", fromlist=["x"]).RES8_WHEEL_SCALE),
 }
 if GRU:
     meta["hidden_shape"] = [mod.rnn.num_layers, 1, mod.rnn.hidden_size]

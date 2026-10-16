@@ -10,5 +10,5 @@ docker run --rm --gpus "\"device=${GPU}\"" \
   -e PYTHONPATH=/workspace/source:/terrain \
   -e GIT_PYTHON_REFRESH=quiet \
   -e TZ=KST-9 \
-  -e KSRC_RES8_STEER_DEG -e KSRC_RES8_WHEEL \
+  -e KSRC_RES8_STEER_DEG -e KSRC_RES8_WHEEL -e KSRC_ROVER_USD \
   "${KSRC_IMAGE:-ksrc-rover:lab2.3.2-rsl312}" "$@"

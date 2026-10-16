@@ -62,6 +62,16 @@ class FirmwareIK:
     def reset(self):
         self.state = (kc.SwerveModuleState * 4)()
 
+    def sync(self, steer_cmd_rad):
+        """Start from the angles the Nucleo is already holding (telemetry steer_cmd_rad, 2026-10-15).
+        A fresh Pi state holds 0 while standing, but the firmware keeps the last run's angles -> the
+        applied_targets obs would be wrong until the first move (and at the +-90 deg seam the fold could
+        pick the other side)."""
+        for m, a in enumerate(steer_cmd_rad):
+            self.state[m].last_angle_rad = float(a)
+            self.state[m].last_cmd_rad = float(a)
+            self.state[m].initialized = 1
+
     def step(self, vx, vy, w, d_steer=None, wheel_gain=None):
         """-> (steer goal [rad] x4, wheel speed [m/s] x4) as the firmware applies them."""
         out = kc.swerve_ik_compute(vx, vy, w, self.modules, FW_MAX_WHEEL_MPS, self.state)
@@ -84,7 +94,8 @@ def action_to_residual(action):
 class StudentObs:
     """Builds the student input vector from SPI telemetry, in the exported layout."""
 
-    TERMS = ("command", "gyro", "gravity", "steering", "steering_rate", "wheel_rate", "applied_targets")
+    TERMS = ("command", "gyro", "gravity", "steering", "steering_rate", "wheel_rate", "applied_targets", "vo")
+    VO_AGE_CAP = 1.0      # rover_env_cfg.VO_DR["age_cap"]: what the sim feeds when there is no VO
 
     def __init__(self, meta: dict, dt: float = 0.02):
         self.hist = int(meta["student_history"])
@@ -103,8 +114,10 @@ class StudentObs:
         self.buf = None
         self.gfilt.reset()
 
-    def frame(self, cmd, tlm, gyro_bias, applied):
-        """One 20 ms frame (dict name -> vector).  applied = (steer goal x4 rad, wheel target x4 rad/s)."""
+    def frame(self, cmd, tlm, gyro_bias, applied, vo=None):
+        """One 20 ms frame (dict name -> vector).  applied = (steer goal x4 rad, wheel target x4 rad/s).
+        vo = (vx, vy [m/s, body], age [s]) of the latest visual-odometry velocity, or None (no VO yet) -> the
+        sim's "no VO" value [0, 0, 0, age_cap].  Only used by students exported with the vo term (v3)."""
         gyro = np.asarray(tlm["gyro_dps"], float) * math.pi / 180.0 - gyro_bias
         acc = np.asarray(tlm["acc_g"], float) * 9.81
         grav = self.gfilt.step(gyro, acc)
@@ -117,6 +130,8 @@ class StudentObs:
             "wheel_rate": np.asarray(tlm["wheel_mps"], np.float32) / WHEEL_RADIUS_M,
             "applied_targets": np.concatenate([np.asarray(applied[0], np.float32),
                                                np.asarray(applied[1], np.float32)]),
+            "vo": (np.array([0.0, 0.0, 0.0, self.VO_AGE_CAP], np.float32) if vo is None or vo[2] >= 0.5 else
+                   np.array([vo[0], vo[1], 1.0, min(float(vo[2]), self.VO_AGE_CAP)], np.float32)),
         }
 
     def push(self, fr) -> np.ndarray:

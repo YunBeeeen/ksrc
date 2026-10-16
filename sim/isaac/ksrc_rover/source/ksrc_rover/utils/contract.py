@@ -42,3 +42,6 @@ RESIDUAL_RATE_LIMIT = 0.10
 # KSRC_RES8_STEER_DEG / KSRC_RES8_WHEEL override (evaluating checkpoints trained at another range)
 RES8_STEER_SCALE_RAD = math.radians(float(os.environ.get("KSRC_RES8_STEER_DEG", "30.0")))
 RES8_WHEEL_SCALE = float(os.environ.get("KSRC_RES8_WHEEL", "0.60"))
+# 2026-10-15 정지 명령 판정 (Res8 stand_mask, pi/policy/run_policy.py, ros/isaac_bridge.py 같은 값)
+STAND_V_M_S = 0.01
+STAND_W_RAD_S = 0.02
