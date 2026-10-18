@@ -1,0 +1,468 @@
+{
+  "status": "incomplete",
+  "stats": {
+    "left": {
+      "count": 0,
+      "non_increasing": 0,
+      "gaps_over_50ms": 0,
+      "encoding": null,
+      "width": null,
+      "height": null,
+      "first_source_ns": null,
+      "last_source_ns": null,
+      "max_age_s": null,
+      "min_age_s": null,
+      "last_age_s": null,
+      "profile_changes": 0,
+      "receipt_rate_hz": 0.0
+    },
+    "right": {
+      "count": 0,
+      "non_increasing": 0,
+      "gaps_over_50ms": 0,
+      "encoding": null,
+      "width": null,
+      "height": null,
+      "first_source_ns": null,
+      "last_source_ns": null,
+      "max_age_s": null,
+      "min_age_s": null,
+      "last_age_s": null,
+      "profile_changes": 0,
+      "receipt_rate_hz": 0.0
+    }
+  },
+  "camera_info": {},
+  "metadata": {},
+  "elapsed_s": 30.005517683000107,
+  "nearest_delta_max_ns": null,
+  "exact_pair_candidates": 0,
+  "pair_window_note": "last 1000 per stream; source stamps unchanged",
+  "system": [
+    {
+      "host_ns": 1792247372846304307,
+      "loadavg": [
+        0.02099609375,
+        0.14013671875,
+        0.24560546875
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29439 0 7740 734887 1618 0 624 0 0 0",
+      "rss_bytes": 104747008,
+      "temperatures_mC": {
+        "thermal_zone0": "56200"
+      }
+    },
+    {
+      "host_ns": 1792247373852173471,
+      "loadavg": [
+        0.02099609375,
+        0.14013671875,
+        0.24560546875
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29440 0 7740 735288 1618 0 624 0 0 0",
+      "rss_bytes": 104755200,
+      "temperatures_mC": {
+        "thermal_zone0": "55650"
+      }
+    },
+    {
+      "host_ns": 1792247374857387766,
+      "loadavg": [
+        0.02099609375,
+        0.14013671875,
+        0.24560546875
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29441 0 7740 735688 1618 0 624 0 0 0",
+      "rss_bytes": 104755200,
+      "temperatures_mC": {
+        "thermal_zone0": "55650"
+      }
+    },
+    {
+      "host_ns": 1792247375862485300,
+      "loadavg": [
+        0.02099609375,
+        0.14013671875,
+        0.24560546875
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29442 0 7741 736089 1618 0 624 0 0 0",
+      "rss_bytes": 104755200,
+      "temperatures_mC": {
+        "thermal_zone0": "55650"
+      }
+    },
+    {
+      "host_ns": 1792247376867640646,
+      "loadavg": [
+        0.02099609375,
+        0.14013671875,
+        0.24560546875
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29444 0 7741 736489 1618 0 624 0 0 0",
+      "rss_bytes": 104755200,
+      "temperatures_mC": {
+        "thermal_zone0": "56200"
+      }
+    },
+    {
+      "host_ns": 1792247377872849822,
+      "loadavg": [
+        0.01904296875,
+        0.1376953125,
+        0.244140625
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29445 0 7741 736889 1618 0 624 0 0 0",
+      "rss_bytes": 104755200,
+      "temperatures_mC": {
+        "thermal_zone0": "55650"
+      }
+    },
+    {
+      "host_ns": 1792247378878070441,
+      "loadavg": [
+        0.01904296875,
+        0.1376953125,
+        0.244140625
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29446 0 7741 737290 1618 0 624 0 0 0",
+      "rss_bytes": 104755200,
+      "temperatures_mC": {
+        "thermal_zone0": "56750"
+      }
+    },
+    {
+      "host_ns": 1792247379883280873,
+      "loadavg": [
+        0.01904296875,
+        0.1376953125,
+        0.244140625
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29447 0 7741 737690 1618 0 624 0 0 0",
+      "rss_bytes": 104755200,
+      "temperatures_mC": {
+        "thermal_zone0": "54550"
+      }
+    },
+    {
+      "host_ns": 1792247380888415821,
+      "loadavg": [
+        0.01904296875,
+        0.1376953125,
+        0.244140625
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29449 0 7741 738091 1618 0 624 0 0 0",
+      "rss_bytes": 104755200,
+      "temperatures_mC": {
+        "thermal_zone0": "54550"
+      }
+    },
+    {
+      "host_ns": 1792247381893613415,
+      "loadavg": [
+        0.01904296875,
+        0.1376953125,
+        0.244140625
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29450 0 7741 738492 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "55100"
+      }
+    },
+    {
+      "host_ns": 1792247382898710730,
+      "loadavg": [
+        0.01708984375,
+        0.13525390625,
+        0.24267578125
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29451 0 7742 738892 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "55650"
+      }
+    },
+    {
+      "host_ns": 1792247383903820265,
+      "loadavg": [
+        0.01708984375,
+        0.13525390625,
+        0.24267578125
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29453 0 7742 739292 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "56200"
+      }
+    },
+    {
+      "host_ns": 1792247384908940762,
+      "loadavg": [
+        0.01708984375,
+        0.13525390625,
+        0.24267578125
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29454 0 7742 739693 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "54550"
+      }
+    },
+    {
+      "host_ns": 1792247385914029405,
+      "loadavg": [
+        0.01708984375,
+        0.13525390625,
+        0.24267578125
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29455 0 7742 740093 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "55100"
+      }
+    },
+    {
+      "host_ns": 1792247386918949399,
+      "loadavg": [
+        0.01708984375,
+        0.13525390625,
+        0.24267578125
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29456 0 7746 740490 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "55100"
+      }
+    },
+    {
+      "host_ns": 1792247387924078187,
+      "loadavg": [
+        0.015625,
+        0.1328125,
+        0.2412109375
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29458 0 7746 740891 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "54000"
+      }
+    },
+    {
+      "host_ns": 1792247388929188714,
+      "loadavg": [
+        0.015625,
+        0.1328125,
+        0.2412109375
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29459 0 7746 741291 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "56200"
+      }
+    },
+    {
+      "host_ns": 1792247389934401481,
+      "loadavg": [
+        0.015625,
+        0.1328125,
+        0.2412109375
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29460 0 7746 741692 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "55650"
+      }
+    },
+    {
+      "host_ns": 1792247390939503192,
+      "loadavg": [
+        0.015625,
+        0.1328125,
+        0.2412109375
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29461 0 7747 742092 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "54550"
+      }
+    },
+    {
+      "host_ns": 1792247391944583048,
+      "loadavg": [
+        0.015625,
+        0.1328125,
+        0.2412109375
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29462 0 7747 742493 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "55650"
+      }
+    },
+    {
+      "host_ns": 1792247392949654646,
+      "loadavg": [
+        0.01416015625,
+        0.13037109375,
+        0.23974609375
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29464 0 7747 742893 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "54550"
+      }
+    },
+    {
+      "host_ns": 1792247393954719871,
+      "loadavg": [
+        0.01416015625,
+        0.13037109375,
+        0.23974609375
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29465 0 7747 743294 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "56200"
+      }
+    },
+    {
+      "host_ns": 1792247394959842317,
+      "loadavg": [
+        0.01416015625,
+        0.13037109375,
+        0.23974609375
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29467 0 7747 743694 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "56200"
+      }
+    },
+    {
+      "host_ns": 1792247395964991706,
+      "loadavg": [
+        0.01416015625,
+        0.13037109375,
+        0.23974609375
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29468 0 7747 744095 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "55100"
+      }
+    },
+    {
+      "host_ns": 1792247396970114021,
+      "loadavg": [
+        0.01416015625,
+        0.13037109375,
+        0.23974609375
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29469 0 7747 744495 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "55650"
+      }
+    },
+    {
+      "host_ns": 1792247397975296760,
+      "loadavg": [
+        0.0126953125,
+        0.1279296875,
+        0.23828125
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29470 0 7747 744896 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "55100"
+      }
+    },
+    {
+      "host_ns": 1792247398980474962,
+      "loadavg": [
+        0.0126953125,
+        0.1279296875,
+        0.23828125
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29471 0 7748 745296 1618 0 624 0 0 0",
+      "rss_bytes": 104759296,
+      "temperatures_mC": {
+        "thermal_zone0": "54550"
+      }
+    },
+    {
+      "host_ns": 1792247399985539572,
+      "loadavg": [
+        0.0126953125,
+        0.1279296875,
+        0.23828125
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29473 0 7748 745697 1618 0 624 0 0 0",
+      "rss_bytes": 104763392,
+      "temperatures_mC": {
+        "thermal_zone0": "55650"
+      }
+    },
+    {
+      "host_ns": 1792247400990602774,
+      "loadavg": [
+        0.0126953125,
+        0.1279296875,
+        0.23828125
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29474 0 7748 746097 1618 0 624 0 0 0",
+      "rss_bytes": 104763392,
+      "temperatures_mC": {
+        "thermal_zone0": "56200"
+      }
+    },
+    {
+      "host_ns": 1792247401995700364,
+      "loadavg": [
+        0.0126953125,
+        0.1279296875,
+        0.23828125
+      ],
+      "disk_free_bytes": 14321061888,
+      "proc_stat": "cpu  29475 0 7748 746498 1618 0 624 0 0 0",
+      "rss_bytes": 104763392,
+      "temperatures_mC": {
+        "thermal_zone0": "55650"
+      }
+    }
+  ],
+  "clock": {
+    "use_sim_time": false,
+    "age_source": "ros_now_minus_source_stamp"
+  },
+  "imu_clock_verified": false
+}
